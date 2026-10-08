@@ -31,6 +31,7 @@ dependencies = [
 [project.scripts]
 lens = "src.lens.cli:main"
 membus = "src.membus.cli:console_main"
+redesign = "src.redesign.cli:main"
 
 [project.optional-dependencies]
 # needed only by plot_benchmark_results.py
