@@ -112,3 +112,43 @@ def test_unknown_kinds():
     wide.add_range("x", 0, P - 1, "rx")
     wide.add_range("y", 0, 255, "ry")
     assert wide.implies(mul("c", "x")).kind == "nowrap-bound"
+
+
+def test_add_premise_expands_nothing():
+    s = PolySolver(VarTable(), declared=AFTER_GIVEN)
+    for i, e in enumerate(AFTER):
+        s.add_premise(e, tag=f"p{i}")
+    assert s.premises_expanded == 0 and s.premises_split == 0
+
+
+def test_rule_s_finds_a_sum_hidden_by_cancellation():
+    # c * (x*y - x*y + a + b): only a sum after expansion. A syntactic degree
+    # check would have skipped it; rule S must still split it.
+    s = PolySolver(VarTable(), declared=["c", "x", "y", "a", "b"])
+    s.add_premise(mul("c", add(sub(mul("x", "y"), mul("x", "y")), "a", "b")), tag="p")
+    s.add_range("a", 0, 255, "ra")
+    s.add_range("b", 0, 255, "rb")
+    v = s.implies(mul("c", "a"))
+    assert v.rule == "nowrap-split" and set(v.ranges) == {"a", "b"}
+
+
+def test_rule_s_rejects_a_sum_of_squares():
+    sq = add(*[mul(sub(f"a{i}", f"b{i}"), sub(f"a{i}", f"b{i}")) for i in range(4)])
+    names = ["c"] + [f"{x}{i}" for x in "ab" for i in range(4)]
+    s = PolySolver(VarTable(), declared=names)
+    s.add_premise(mul("c", sq), tag="p")
+    s.add_range("a0", 0, 255, "r")
+    assert isinstance(s.implies(mul("c", "a0")), Unknown)
+    assert s._premises[0].sums == []  # expanded, found nonlinear, not a sum
+
+
+def test_rule_s_split_is_lazy_and_cached():
+    s = PolySolver(VarTable(), declared=AFTER_GIVEN)
+    for i, e in enumerate(AFTER):
+        s.add_premise(e, tag=f"p{i}")
+    for a in ["a0", "a1", "a2", "a3"]:
+        s.add_range(a, 0, 255, f"r_{a}")
+    for a in ["a0", "a1", "a2", "a3"]:
+        assert s.implies(mul(sub(1, "cmp"), a)).rule == "nowrap-split"
+    # p0 matches first and is split once for all four queries; p1 is never split.
+    assert s.premises_split == 1

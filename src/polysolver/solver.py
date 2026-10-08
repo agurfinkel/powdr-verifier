@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import poly as P
 from .defs import NO_DEFS, Defs, InvalidDefs, Opaque
@@ -61,8 +61,11 @@ class _Premise:
     expr: Expr  # the expression exactly as given
     key: P.Key | None = None  # zero key; None until computed, or if too big
     expanded: bool = False  # True once we tried to compute the key
-    # Each top-level factor expanded on its own (for rule S); None if too big.
-    factors: list | None = None
+    # Rule S's view, computed on first use: the top-level factors as written,
+    # their expansions (filled in only as needed), and which ones are sums.
+    factors: list | None = None  # the expressions of the top-level * chain
+    polys: dict = field(default_factory=dict)  # factor position -> Poly (or None)
+    sums: list | None = None  # [(factor position, Poly)] for the linear sums
 
 
 class PolySolver:
@@ -83,15 +86,13 @@ class PolySolver:
         # Premise index for rule N: variable -> ids of the premises that mention it.
         # Built from the syntax alone, so adding a premise costs no expansion.
         self._by_var: dict[Var, list[int]] = defaultdict(list)
-        # Sum index for rule S: variable -> (premise id, factor position) for each
-        # factor that is a plain sum c1*a1 + ... + cn*an containing the variable.
-        self._sum_index: dict[Var, list[tuple[int, int]]] = defaultdict(list)
         self._ranges: dict[Var, tuple[int, int, list[str]]] = {}  # v -> (lo, hi, tags)
         # Verdict caches, keyed by the query's zero key. Implied stays true as
         # premises grow; Unknown may not, so that cache is cleared on every add.
         self._implied: dict[P.Key, Implied] = {}
         self._unknown: dict[P.Key, Unknown] = {}
-        self.premises_expanded = 0  # how many premise keys were computed
+        self.premises_expanded = 0  # premise keys computed (rule N)
+        self.premises_split = 0  # premises split into factors (rule S)
 
     # ------------------------------------------------------------ inputs
 
@@ -101,10 +102,10 @@ class PolySolver:
         idx = len(self._premises)
         prem = _Premise(tag, e)
         self._premises.append(prem)
-        # Index by the variables as written; the full key is computed lazily.
+        # Index by the variables as written. Nothing is expanded here: rule N
+        # and rule S expand a premise only when a query first needs it.
         for v in vs:
             self._by_var[v].append(idx)
-        self._index_sums(idx, prem)
         self._unknown.clear()  # an earlier Unknown might now be provable
 
     def add_range(self, x: str, lo: int, hi: int, tag: str) -> None:
@@ -232,27 +233,42 @@ class PolySolver:
 
     # ------------------------------------------------------------ rule S
 
-    def _index_sums(self, idx: int, prem: _Premise) -> None:
-        """Index linear factors with >= 2 variables and no constant term.
+    def _premise_sums(self, i: int) -> list:
+        """The premise's top-level factors that are sums c1*a1 + ... + cn*an.
 
-        Reads the premise's top-level product F1 * F2 * ... as written and
-        expands each factor on its own, which is cheap (what if the factor has further products in it?). A factor that is a sum
-        like a0 + a1 + a2 + a3 is what rule S splits, so it is indexed under
-        each of its variables.
+        Computed on first use and cached, so only premises that rule S actually
+        looks at are ever split. Each factor is fully expanded, so a factor that
+        becomes a sum only after cancellation (x*y - x*y + a + b) is still found.
         """
-        try:
-            prem.factors = [
-                P.expand(f, self._plain, self.p, self.max_terms)
-                for f in product_factors(prem.expr)
-            ]
-        except P.ExpansionLimit:
-            return  # leave the premise out of rule S; rule N can still use it
-        for fi, f in enumerate(prem.factors):
-            # Linear: each term is a single variable to the power 1. That also
-            # excludes a constant term, whose monomial is empty.
-            if len(f) >= 2 and all(len(m) == 1 and m[0][1] == 1 for m in f):
-                for ((v, _),) in f:
-                    self._sum_index[v].append((idx, fi))
+        prem = self._premises[i]
+        if prem.sums is None:
+            self.premises_split += 1
+            prem.factors = product_factors(prem.expr)
+            prem.sums = []
+            for fi, f in enumerate(prem.factors):
+                # Expansion never adds variables, so fewer than 2 means never a sum.
+                if len(variables(f)) < 2:
+                    continue
+                poly = self._factor_poly(prem, fi)
+                # Linear with no constant: every term is one variable to the power 1.
+                if (
+                    poly
+                    and len(poly) >= 2
+                    and all(len(m) == 1 and m[0][1] == 1 for m in poly)
+                ):
+                    prem.sums.append((fi, poly))
+        return prem.sums
+
+    def _factor_poly(self, prem: _Premise, fi: int) -> P.Poly | None:
+        """Expansion of one factor, cached; None if it is too big."""
+        if fi not in prem.polys:
+            try:
+                prem.polys[fi] = P.expand(
+                    prem.factors[fi], self._plain, self.p, self.max_terms
+                )
+            except P.ExpansionLimit:
+                prem.polys[fi] = None
+        return prem.polys[fi]
 
     def _rule_s(self, k: P.Key) -> Verdict:
         """Rule S: q is G * a, where some premise is G * (sum containing a).
@@ -264,31 +280,43 @@ class PolySolver:
         for a in sorted(P.key_vars(k)):
             if a not in self._ranges:  # an unranged a can never pass the bound
                 continue
-            for idx, fi in self._sum_index.get(a, ()):
+            # A premise whose sum contains a mentions a syntactically, so the
+            # premise index finds every candidate (as in rule N).
+            for idx in self._by_var.get(a, ()):
                 prem = self._premises[idx]
-                # Build G * a, where G is the product of the premise's other
-                # factors, and check that it is q (up to a constant factor).
-                g = P.var_poly(a)
-                try:
-                    for j, f in enumerate(prem.factors):
-                        if j != fi:
-                            g = P.mul(g, f, self.p, self.max_terms)
-                except P.ExpansionLimit:
-                    continue
-                if P.zkey(g, self.p) != k:
-                    continue
-                # The shape matches; only the no-wrap condition is left.
-                why = self._no_wrap(prem.factors[fi])
-                if why:
-                    kind, msg = why
-                    notes.append(f"{prem.tag}: {msg}")
-                    continue
-                # Report every summand: all their ranges were used.
-                ranged = sorted(self.table.name(v) for ((v, _),) in prem.factors[fi])
-                return Implied("nowrap-split", (prem.tag,), tuple(ranged))
+                for fi, s in self._premise_sums(idx):
+                    if ((a, 1),) not in s:
+                        continue
+                    g = self._other_factors_times(prem, fi, a)
+                    # The shape must match q (up to a constant factor) first.
+                    if g is None or P.zkey(g, self.p) != k:
+                        continue
+                    # The shape matches; only the no-wrap condition is left.
+                    why = self._no_wrap(s)
+                    if why:
+                        kind, msg = why
+                        notes.append(f"{prem.tag}: {msg}")
+                        continue
+                    # Report every summand: all their ranges were used.
+                    ranged = sorted(self.table.name(v) for ((v, _),) in s)
+                    return Implied("nowrap-split", (prem.tag,), tuple(ranged))
         return Unknown(
             "S: " + ("; ".join(notes) if notes else "no ranged sum premise"), kind
         )
+
+    def _other_factors_times(self, prem: _Premise, fi: int, a: Var) -> P.Poly | None:
+        """G * a, where G is the product of the premise's factors other than ``fi``."""
+        g = P.var_poly(a)
+        try:
+            for j in range(len(prem.factors)):
+                if j != fi:
+                    f = self._factor_poly(prem, j)
+                    if f is None:
+                        return None
+                    g = P.mul(g, f, self.p, self.max_terms)
+        except P.ExpansionLimit:
+            return None
+        return g
 
     def _no_wrap(self, s: P.Poly) -> tuple[str, str] | None:
         """(kind, message) saying why the sum ``s`` might wrap past p, or None."""
