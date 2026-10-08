@@ -1,0 +1,155 @@
+"""Polynomials over F_p and the zero key.
+
+A polynomial is a dict ``{monomial: coeff}``. A monomial is a tuple of
+``(Var, exponent)`` pairs sorted by Var; ``()`` is the constant monomial.
+Coefficients live in ``[1, p)``; zero terms are dropped.
+
+The zero key makes a polynomial monic, so two polynomials with the same key
+differ by a nonzero constant factor and have the same zeros.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from .expr import OPS, Expr, UnsupportedExpr
+
+Mono = tuple  # tuple[(Var, exp), ...], e.g. x*x*y is ((x, 2), (y, 1))
+Poly = dict  # dict[Mono, int], e.g. 3*x + 1 is {((x, 1),): 3, (): 1}
+Key = tuple  # tuple[(Mono, coeff), ...], a Poly in a fixed order, made monic
+
+ZERO: Key = ()  # the key of the zero polynomial
+# Full expansion can blow up (a product of n sums has up to |a|*|b|*... terms),
+# so we give up past this many terms instead of hanging.
+MAX_TERMS = 4096
+
+
+class ExpansionLimit(Exception):
+    """An intermediate polynomial grew past the term budget."""
+
+
+def const(k: int, p: int) -> Poly:
+    """The constant ``k``; reducing mod p turns p-1 and -1 into the same value."""
+    k %= p
+    return {(): k} if k else {}
+
+
+def var_poly(v: int) -> Poly:
+    """The polynomial ``v`` (one term, coefficient 1)."""
+    return {((v, 1),): 1}
+
+
+def add(a: Poly, b: Poly, p: int, sign: int = 1) -> Poly:
+    """``a + sign * b``."""
+    out = dict(a)
+    for m, c in b.items():
+        s = (out.get(m, 0) + sign * c) % p
+        # Keep only nonzero terms, so x - x really is the empty polynomial.
+        if s:
+            out[m] = s
+        else:
+            out.pop(m, None)
+    return out
+
+
+def scale(a: Poly, k: int, p: int) -> Poly:
+    """``k * a``; scaling by 0 gives the zero polynomial."""
+    k %= p
+    return {m: c * k % p for m, c in a.items()} if k else {}
+
+
+def mul(a: Poly, b: Poly, p: int, limit: int = MAX_TERMS) -> Poly:
+    """Fully distributed product: every term of ``a`` times every term of ``b``."""
+    out: Poly = {}
+    for ma, ca in a.items():
+        for mb, cb in b.items():
+            m = _mono_mul(ma, mb)
+            # Terms that land on the same monomial are summed; they may cancel.
+            s = (out.get(m, 0) + ca * cb) % p
+            if s:
+                out[m] = s
+            else:
+                out.pop(m, None)
+        # Check once per row, so a runaway product stops early.
+        if len(out) > limit:
+            raise ExpansionLimit
+    return out
+
+
+def _mono_mul(a: Mono, b: Mono) -> Mono:
+    """Multiply two monomials by adding exponents: (x^2 y) * (x z) = x^3 y z."""
+    if not a:  # the constant monomial is the identity
+        return b
+    if not b:
+        return a
+    exps = dict(a)
+    for v, e in b:
+        exps[v] = exps.get(v, 0) + e
+    # Sorting by Var gives each monomial exactly one spelling: x*y == y*x.
+    return tuple(sorted(exps.items()))
+
+
+def expand(
+    e: Expr, lookup: Callable[[str], Poly], p: int, limit: int = MAX_TERMS
+) -> Poly:
+    """Expand an expression into one fully distributed polynomial.
+
+    Walks the JSON tree bottom-up: leaves become polynomials, operators combine
+    them. ``lookup`` decides what a name means: usually just that variable,
+    but a defined variable expands to its definition, which is how
+    definitions are substituted without rewriting the expression.
+    """
+    if isinstance(e, bool):  # bool is an int in Python; never valid here
+        raise UnsupportedExpr(f"not an expression: {e!r}")
+    if isinstance(e, int):
+        return const(e, p)
+    if isinstance(e, str):
+        return lookup(e)
+    if isinstance(e, list):
+        if len(e) == 2 and e[0] == "-":
+            return scale(expand(e[1], lookup, p, limit), -1, p)
+        if len(e) == 3 and e[1] in OPS:
+            a = expand(e[0], lookup, p, limit)
+            b = expand(e[2], lookup, p, limit)
+            if e[1] == "*":
+                return mul(a, b, p, limit)
+            # "+" and "-" share one code path; "-" just flips the sign of b.
+            out = add(a, b, p, 1 if e[1] == "+" else -1)
+            if len(out) > limit:
+                raise ExpansionLimit
+            return out
+    raise UnsupportedExpr(f"not an expression: {e!r}")
+
+
+def degree(m: Mono) -> int:
+    """Total degree: x^2 y has degree 3, a constant has degree 0."""
+    return sum(e for _, e in m)
+
+
+def _order(m: Mono) -> tuple:
+    # Highest degree first, then by monomial; the first term is the leading one.
+    return (-degree(m), m)
+
+
+def zkey(a: Poly, p: int) -> Key:
+    """Monic key of ``a = 0``: divide by the leading coefficient.
+
+    ``c = 0``, ``-c = 0`` and ``3c = 0`` have the same zeros, so they should
+    get the same key. Dividing every coefficient by the leading one makes
+    the leading coefficient 1 and erases that difference.
+    """
+    if not a:
+        return ZERO
+    monos = sorted(a, key=_order)  # a fixed order, so equal polys give equal keys
+    inv = pow(a[monos[0]], p - 2, p)  # inverse by Fermat: c^(p-2) = 1/c mod p
+    return tuple((m, a[m] * inv % p) for m in monos)
+
+
+def key_vars(k: Key) -> set[int]:
+    """The variables that occur in a key."""
+    return {v for m, _ in k for v, _ in m}
+
+
+def is_constant(k: Key) -> bool:
+    """True if the key has no variables (only the constant term, or nothing)."""
+    return all(m == () for m, _ in k)

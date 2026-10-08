@@ -1,0 +1,93 @@
+"""One circuit dump, reduced to what the per-constraint sweep needs."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from src.lens.loader import load, machine_of
+from src.lens.resolve import group_dir, resolve, substitutions_path
+from src.paths import POWDR_DUMPS_DIR
+from src.polysolver import BABYBEAR, Expr, variables
+
+MEMORY_BUS = 1
+
+
+@dataclass
+class Circuit:
+    label: str  # e.g. "008_trivial_simp"
+    constraints: list[Expr]
+    bus_interactions: list[dict]
+    derived: dict[str, list[dict]] = field(default_factory=dict)  # name -> recipes
+    columns: frozenset[str] = frozenset()
+
+    @classmethod
+    def from_machine(cls, label: str, machine: dict) -> Circuit:
+        derived: dict[str, list[dict]] = {}
+        for entry in machine.get("derived_columns", []):
+            name, recipe = entry[-2], entry[-1]  # [is_new?, name, recipe]
+            derived.setdefault(name, []).append(recipe)
+        cons = machine.get("constraints", [])
+        buses = machine.get("bus_interactions", [])
+        # Columns come from constraints and buses only. Derived recipes can
+        # mention columns the circuit no longer has.
+        cols: set[str] = set()
+        for e in cons:
+            cols |= variables(e)
+        for bi in buses:
+            for e in [bi["mult"], *bi["args"]]:
+                cols |= variables(e)
+        return cls(label, cons, buses, derived, frozenset(cols))
+
+
+def load_step(group: str, block: str, step: str, root: Path | None = None) -> Circuit:
+    """Load ``apc_candidate_<block>_<step>`` from the group's dump directory."""
+    entry = resolve(group, block, step, root or POWDR_DUMPS_DIR)
+    return Circuit.from_machine(entry.label, machine_of(load(entry.path)))
+
+
+def load_substitutions(
+    group: str, block: str, root: Path | None = None
+) -> dict[str, Expr]:
+    """The block's eliminated columns and what replaced them (empty if no file)."""
+    path = substitutions_path(group_dir(group, root or POWDR_DUMPS_DIR), block)
+    return {name: e for name, e in load(path)} if path else {}
+
+
+def substitute(e: Expr, mapping: dict[str, Expr]) -> Expr:
+    """``e`` with every mapped variable replaced; ``e`` itself is not modified."""
+    if isinstance(e, str):
+        return mapping.get(e, e)
+    if isinstance(e, list):
+        if len(e) == 2:
+            return [e[0], substitute(e[1], mapping)]
+        return [substitute(e[0], mapping), e[1], substitute(e[2], mapping)]
+    return e
+
+
+def byte_ranges(c: Circuit, p: int = BABYBEAR) -> list[tuple[str, int, int]]:
+    """Data limbs of memory receives are bytes (the MEMORY_RECV_BYTES consequence).
+
+    Only receives with constant multiplicity -1 and limbs that are bare
+    columns count; a gated receive is skipped, which costs completeness only.
+    """
+    out: dict[str, tuple[str, int, int]] = {}
+    for bi in c.bus_interactions:
+        if bi["id"] == MEMORY_BUS and bi["mult"] == p - 1:
+            # args are [address_space, pointer, data..., timestamp]
+            for limb in bi["args"][2:-1]:
+                if isinstance(limb, str):
+                    out[limb] = (limb, 0, 255)
+    return list(out.values())
+
+
+def recipe_columns(recipe: Any) -> set[str]:
+    """Column names anywhere inside a derived-column recipe."""
+    if isinstance(recipe, str):
+        return {recipe} if "@" in recipe else set()
+    if isinstance(recipe, dict):
+        recipe = list(recipe.values())
+    if isinstance(recipe, list):
+        return set().union(*(recipe_columns(r) for r in recipe)) if recipe else set()
+    return set()
