@@ -78,7 +78,8 @@ class Report:
     direction: str
     mapping: Mapping
     obligations: list[Obligation] = field(default_factory=list)
-    premises_expanded: int = 0
+    premises_expanded: int = 0  # premise keys PolySolver computed (rule N)
+    premises_split: int = 0  # premises PolySolver split into factors (rule S)
 
     @property
     def verified(self) -> bool:
@@ -184,6 +185,7 @@ def sweep(
         else:
             report.obligations.append(check(f"{col}:def{i + 1}", [col, "-", rhs]))
     report.premises_expanded = solver.premises_expanded
+    report.premises_split = solver.premises_split
     return report
 
 

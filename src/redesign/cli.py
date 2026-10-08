@@ -84,6 +84,7 @@ def _as_dict(r: Report) -> dict:
         "verified": r.verified,
         "counts": dict(r.counts()),
         "premises_expanded": r.premises_expanded,
+        "premises_split": r.premises_split,
         "witnesses": [
             {"columns": cols, "witness": w} for cols, w in r.mapping.witnesses
         ],
@@ -96,7 +97,7 @@ def _print(r: Report, verbose: bool) -> None:
     status = "verified" if r.verified else "NOT verified"
     counts = ", ".join(f"{k} {v}" for k, v in sorted(r.counts().items()))
     print(
-        f"{r.direction}: {status}  ({counts}; {r.premises_expanded} premises expanded)"
+        f"{r.direction}: {status}  ({counts}; {r.premises_expanded} premises expanded, {r.premises_split} split)"
     )
     for cols, w in r.mapping.witnesses:
         print(f"  witness  {', '.join(cols)} := {json.dumps(w)}")
