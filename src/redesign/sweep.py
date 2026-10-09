@@ -101,6 +101,7 @@ class Report:
     premises_split: int = 0  # premises PolySolver split into factors (rule S)
     hints_accepted: int = 0  # solved equations PolySolver checked and kept
     hints_rejected: int = 0  # hints whose check failed (not used)
+    constants_solved: int = 0  # premises that pinned a variable (solve_constants)
 
     @property
     def verified(self) -> bool:
@@ -259,7 +260,8 @@ def sweep(
     
     report.premises_expanded = solver.premises_expanded
     report.premises_split = solver.premises_split
-    report.hints_accepted = solver.solved_count
+    report.constants_solved = solver.constants_solved
+    report.hints_accepted = solver.solved_count - solver.constants_solved
     report.hints_rejected = solver.solved_rejected
     return report
 

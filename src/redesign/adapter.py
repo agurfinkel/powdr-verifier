@@ -12,12 +12,16 @@ def reference_solver(
     ref: Circuit,
     use_ranges: bool = True,
     hints: list[tuple[str, Expr]] = (),
+    constants: bool = False,
 ) -> PolySolver:
     """Premises and ranges from the reference side only (the polarity rule).
 
     ``hints`` are candidate solved equations x = t over reference columns,
     tried in order. The solver checks each one and keeps only those that
     follow from what it already knows; a rejected hint costs completeness only.
+    With ``constants``, the solver then also solves every premise that pins a
+    variable to a constant (after the hints, so the two do not compete for a
+    column).
     """
     s = PolySolver(table, declared=ref.columns)
     for i, c in enumerate(ref.constraints):
@@ -27,4 +31,6 @@ def reference_solver(
             s.add_range(x, lo, hi, tag=f"{ref.label}:bytes:{x}")
     for x, t in hints:
         s.add_solved(x, t, tag=f"hint:{x}")
+    if constants:
+        s.solve_constants()
     return s
