@@ -99,6 +99,8 @@ class Report:
     obligations: list[Obligation] = field(default_factory=list)
     premises_expanded: int = 0  # premise keys PolySolver computed (rule N)
     premises_split: int = 0  # premises PolySolver split into factors (rule S)
+    hints_accepted: int = 0  # solved equations PolySolver checked and kept
+    hints_rejected: int = 0  # hints whose check failed (not used)
 
     @property
     def verified(self) -> bool:
@@ -177,7 +179,11 @@ def sweep(
         except UndefinedVariable as exc:
             return Obligation(name, "undecided", str(exc), reason="mapping gap")
         if isinstance(v, Implied):
-            detail = ", ".join(v.premises + tuple(f"range {r}" for r in v.ranges))
+            detail = ", ".join(
+                v.premises
+                + tuple(f"range {r}" for r in v.ranges)
+                + tuple(f"solved {t}" for t in v.solved)
+            )
             ob = Obligation(name, v.rule, detail, via_mapping=mapped)
             return _remember(cache, key, ob)
         # Undecided: record why, so reports can group these.
@@ -253,6 +259,8 @@ def sweep(
     
     report.premises_expanded = solver.premises_expanded
     report.premises_split = solver.premises_split
+    report.hints_accepted = solver.solved_count
+    report.hints_rejected = solver.solved_rejected
     return report
 
 
