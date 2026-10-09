@@ -12,6 +12,11 @@ from src.paths import POWDR_DUMPS_DIR
 from src.polysolver import BABYBEAR, Expr, variables
 
 MEMORY_BUS = 1
+# Lookups into fixed tables: PcLookup, VariableRangeChecker, BitwiseLookup,
+# TupleRangeChecker. Ids as in src/bus_interactions/__init__.py::OpenVMBusInteraction
+# (not imported: that module pulls in pysmt). Memory and the execution bridge
+# are stateful and belong to Step C.
+STATELESS_BUSES = frozenset({2, 3, 6, 7})
 
 
 @dataclass
@@ -40,6 +45,11 @@ class Circuit:
                 cols |= variables(e)
         return cls(label, cons, buses, derived, frozenset(cols))
 
+    @property
+    def stateless(self) -> list[dict]:
+        """Stateless bus interactions: each one is a fact "mult != 0 => args in table"."""
+        return [bi for bi in self.bus_interactions if bi["id"] in STATELESS_BUSES]
+
 
 def load_step(group: str, block: str, step: str, root: Path | None = None) -> Circuit:
     """Load ``apc_candidate_<block>_<step>`` from the group's dump directory."""
@@ -64,6 +74,20 @@ def substitute(e: Expr, mapping: dict[str, Expr]) -> Expr:
             return [e[0], substitute(e[1], mapping)]
         return [substitute(e[0], mapping), e[1], substitute(e[2], mapping)]
     return e
+
+
+def substitute_interaction(bi: dict, mapping: dict[str, Expr]) -> dict:
+    """A copy of a bus interaction with ``mapping`` applied to mult and args."""
+    return {
+        "id": bi["id"],
+        "mult": substitute(bi["mult"], mapping),
+        "args": [substitute(a, mapping) for a in bi["args"]],
+    }
+
+
+def interaction_columns(bi: dict) -> set[str]:
+    """Columns of a bus interaction's mult and args."""
+    return set().union(*(variables(e) for e in [bi["mult"], *bi["args"]]))
 
 
 def byte_ranges(c: Circuit, p: int = BABYBEAR) -> list[tuple[str, int, int]]:

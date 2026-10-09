@@ -30,7 +30,7 @@ def check_step(
         reports.append(sweep("completeness", before, after, m, solver))
     if "soundness" in directions:
         solver = reference_solver(table, after, use_ranges)
-        m = soundness_mapping(after, before, subs, solver)
+        m = soundness_mapping(after, before, subs, solver) # <- Polysolver used to find missing witnesses
         reports.append(sweep("soundness", after, before, m, solver))
     return reports
 

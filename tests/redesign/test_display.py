@@ -20,12 +20,15 @@ def test_records_add_up():
     assert len(steps) == 2 * 40  # dumps 000..040 -> 40 pairs, two directions each
     for s in steps:
         assert sum(s["categories"].values()) == s["obligations"]
-        undecided = sum(n for k, n in s["categories"].items() if k.startswith("undecided|"))
-        assert s["verified"] == (undecided == 0 and not s["unmapped"] and not s["error"])
-        for k in s["categories"]:
-            rung, sub = k.split("|")
+        assert sum(s["obligations_by_kind"].values()) == s["obligations"]
+        undecided = 0
+        for k, n in s["categories"].items():
+            kind, rung, sub = k.split("|")
+            assert kind in ("constraint", "bus")
             if rung == "undecided":
+                undecided += n
                 assert sub in REASONS, sub  # every reason is a documented one
+        assert s["verified"] == (undecided == 0 and not s["unmapped"] and not s["error"])
     json.dumps(data)  # saved as-is by --save
 
 
@@ -41,7 +44,7 @@ def test_is_zero_reasons():
         "nonlinear, no match",  # (1 - cmp) * sum a: a sum of four premises
         "opaque QuotientOrZero",  # f * sum a - cmp
     ]
-    assert snd.categories()[("normalize", "via mapping")] == 1  # through the witness
+    assert snd.categories()[("constraint", "normalize", "via mapping")] == 1  # witness
 
 
 def test_report_renders_the_numbers():
@@ -66,3 +69,19 @@ def test_cli_sweep_save_then_report(tmp_path, capsys):
     assert "Step pairs" in reported
     # Re-displaying the saved file gives exactly the same report.
     assert swept == reported
+
+
+def test_format_1_files_still_render():
+    """A sweep saved before obligations had a kind (constraints only)."""
+    data = _sweep()
+    for s in data["steps"]:
+        s["categories"] = {
+            k.split("|", 1)[1]: n for k, n in s["categories"].items() if k.startswith("constraint|")
+        }
+        for key in ("obligations_by_kind", "cached_by_kind", "unmapped_reasons"):
+            del s[key]
+    data["meta"]["format"] = 1
+    console = Console(record=True, width=200)
+    render(data, console)
+    out = console.export_text()
+    assert "algebraic constraints" in out and "stateless bus" not in out

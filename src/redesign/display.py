@@ -3,7 +3,7 @@
 Sections: what the words mean, step outcomes, where the obligations went
 (with subcategories), which passes leave work for SMT, recurring problem
 steps across blocks, and the mapping. Every number is counted from the
-records; nothing is estimated.
+records; nothing is estimated. Reads format 1 files (constraints only) too.
 """
 
 from __future__ import annotations
@@ -19,6 +19,11 @@ from rich.text import Text
 from .sweep import REASONS
 
 DIRS = ("completeness", "soundness")
+
+KINDS = {
+    "constraint": "algebraic constraints",
+    "bus": "stateless bus interactions (lookups)",
+}
 
 # Display order and meaning of every (rung, subcategory) the sweep produces.
 DISCHARGED_ROWS = [
@@ -56,19 +61,29 @@ RUNG_NOTE = {
     "normalize": "PolySolver rule N",
     "nowrap-split": "PolySolver rule S",
 }
+# The same for stateless bus interactions: canonical rungs only, so far.
+BUS_ROWS = [
+    ("trivial", "", "multiplicity is 0: the lookup asserts nothing"),
+    ("identical", "direct", "the reference has the same lookup (bus, mult, args)"),
+    ("identical", "via mapping", "same, once mapped columns are substituted"),
+]
+BUS_RUNG_NOTE = {
+    "trivial": "rung 1, canon mult = 0",
+    "identical": "rung 2, lens _bus_exact_key",
+}
 
 LEGEND = """\
 [b]Step pair[/b]  two consecutive dumps of one block: Before -> After, one optimizer pass.
 [b]Direction[/b]  [b]completeness[/b]: every Before run maps to an After run, so each After
            constraint is checked against Before. [b]soundness[/b]: the reverse.
-[b]Obligation[/b] one candidate constraint c, with candidate-only columns replaced by
-           their mapping w. It must follow from the reference side's constraints
-           and byte ranges. One obligation per candidate constraint.
-[b]Discharged[/b] proved without SMT, by a canonical match or by PolySolver.
-[b]Undecided[/b]  no rule applied. Not a bug: it is what the SMT rungs (not built yet)
-           would get. A step is [b]discharged[/b] only if all its obligations are.
-[b]Scope[/b]      algebraic constraints only. Bus interactions (memory, execution
-           bridge, lookups) are not checked yet, so "discharged" is not "equivalent"."""
+[b]Obligation[/b] one candidate constraint c, or one candidate stateless lookup, with
+           candidate-only columns replaced by their mapping w. It must follow from
+           the reference side's constraints, lookups and byte ranges.
+[b]Discharged[/b] proved without SMT: by a canonical match, or (constraints only) PolySolver.
+[b]Undecided[/b]  no rule applied. Not a bug: it is what later rungs (SMT, PolySolver for
+           lookups) would get. A step is [b]discharged[/b] only if all its obligations are.
+[b]Scope[/b]      constraints and stateless lookups. Stateful buses (memory, execution
+           bridge) are not checked yet, so "discharged" is not "equivalent"."""
 
 
 def _pct(n: int, total: int) -> str:
@@ -88,28 +103,60 @@ def _split(steps: list[dict]) -> dict[str, list[dict]]:
     return out
 
 
-def _categories(records: list[dict]) -> Counter:
+def _key(k: str) -> tuple[str, str, str]:
+    """(kind, rung, sub) from a record key; format 1 keys have no kind."""
+    parts = k.split("|")
+    return ("constraint", *parts) if len(parts) == 2 else tuple(parts)
+
+
+def _categories(records: list[dict], kind: str) -> Counter:
+    """(rung, sub) counts for one kind of obligation."""
     total = Counter()
     for s in records:
         for k, n in s["categories"].items():
-            rung, sub = k.split("|", 1)
-            total[(rung, sub)] += n
+            kd, rung, sub = _key(k)
+            if kd == kind:
+                total[(rung, sub)] += n
     return total
 
 
-def _undecided(s: dict) -> int:
-    return sum(n for k, n in s["categories"].items() if k.startswith("undecided|"))
+def _undecided(s: dict, kind: str | None = None) -> int:
+    return sum(
+        n
+        for k, n in s["categories"].items()
+        if _key(k)[1] == "undecided" and kind in (None, _key(k)[0])
+    )
+
+
+def _label(kind: str, reason: str) -> str:
+    # Shared reasons (e.g. "unmapped column") get a prefix when they are about a lookup.
+    if kind == "bus" and not reason.startswith("bus:"):
+        return f"bus: {reason}"
+    return reason
 
 
 def _reasons(records: list[dict]) -> Counter:
     out = Counter()
     for s in records:
         for k, n in s["categories"].items():
-            if k.startswith("undecided|"):
-                out[k.split("|", 1)[1]] += n
+            kind, rung, sub = _key(k)
+            if rung == "undecided":
+                out[_label(kind, sub)] += n
         if s["error"]:
             out["mapping error"] += 1
     return out
+
+
+def _witness_failed(s: dict) -> bool:
+    """Some column is unmapped because the witness search failed (not lookup-only)."""
+    reasons = s.get("unmapped_reasons")
+    if reasons is None:  # format 1: every unmapped column was a search failure
+        return bool(s["unmapped"])
+    return any(r != "lookup-only" for r in reasons.values())
+
+
+def _has_kind(steps: list[dict], kind: str) -> bool:
+    return any(_key(k)[0] == kind for s in steps for k in s["categories"])
 
 
 def _top(c: Counter, n: int = 2) -> str:
@@ -147,15 +194,26 @@ def _outcomes(by_dir: dict[str, list[dict]]) -> Table:
         ),
         (
             "undecided left",
-            lambda s: not s["verified"] and not s["error"] and not s["unmapped"],
+            lambda s: not s["verified"] and not s["error"] and not _witness_failed(s),
             "yellow",
-            "some obligations need SMT",
+            "some obligations need a later rung",
         ),
         (
-            "unmapped columns",
-            lambda s: bool(s["unmapped"]),
+            "  …only lookups undecided",
+            lambda s: (
+                not s["verified"]
+                and not s["error"]
+                and not _witness_failed(s)
+                and _undecided(s, "constraint") == 0
+            ),
+            "dim",
+            "(part of the row above) every constraint discharged; only lookups left",
+        ),
+        (
+            "witness search failed",
+            _witness_failed,
             "red",
-            "the mapping could not define a column (soundness witness search failed)",
+            "a merged column got no witness (soundness), so its constraints are stuck",
         ),
         (
             "mapping error",
@@ -175,12 +233,14 @@ def _outcomes(by_dir: dict[str, list[dict]]) -> Table:
     return t
 
 
-def _obligations(by_dir: dict[str, list[dict]]) -> Table:
+def _obligations(by_dir: dict[str, list[dict]], kind: str) -> Table:
     dirs = [d for d in DIRS if by_dir[d]]
-    cats = {d: _categories(by_dir[d]) for d in dirs}
+    cats = {d: _categories(by_dir[d], kind) for d in dirs}
     totals = {d: sum(cats[d].values()) for d in dirs}
+    bus = kind == "bus"
+    rows, notes = (BUS_ROWS, BUS_RUNG_NOTE) if bus else (DISCHARGED_ROWS, RUNG_NOTE)
     t = Table(
-        title="Obligations: where each one was decided",
+        title=f"Obligations, {KINDS[kind]}: where each one was decided",
         title_justify="left",
         box=box.SIMPLE_HEAD,
     )
@@ -197,15 +257,15 @@ def _obligations(by_dir: dict[str, list[dict]]) -> Table:
         ]
 
     last = None
-    for rung, sub, meaning in DISCHARGED_ROWS:
+    for rung, sub, meaning in rows:
         if rung != last:
             if last is not None:
                 t.add_section()
             t.add_row(
                 Text(rung, style="green bold"),
-                Text(RUNG_NOTE[rung], style="dim"),
+                Text(notes[rung], style="dim"),
                 *rung_total(rung),
-                "",
+                "" if sub else meaning,  # a rung with no subcategories explains itself
             )
             last = rung
         if sub:
@@ -218,7 +278,7 @@ def _obligations(by_dir: dict[str, list[dict]]) -> Table:
     t.add_section()
     t.add_row(
         Text("undecided", style="yellow bold"),
-        Text("left for SMT", style="dim"),
+        Text("left for later rungs", style="dim"),
         *rung_total("undecided"),
         "",
     )
@@ -236,7 +296,7 @@ def _obligations(by_dir: dict[str, list[dict]]) -> Table:
         )
     t.add_section()
     t.add_row("total", "", *[f"{totals[d]:,}" for d in dirs], "", style="bold")
-    cached = [sum(s["cached"] for s in by_dir[d]) for d in dirs]
+    cached = [sum(_cached(s, kind) for s in by_dir[d]) for d in dirs]
     t.add_row(
         Text("of which cache hits", style="dim"),
         "",
@@ -244,6 +304,13 @@ def _obligations(by_dir: dict[str, list[dict]]) -> Table:
         "repeats of an obligation already decided in the same step",
     )
     return t
+
+
+def _cached(s: dict, kind: str) -> int:
+    by_kind = s.get("cached_by_kind")
+    if by_kind is None:  # format 1: all obligations were constraints
+        return s["cached"] if kind == "constraint" else 0
+    return by_kind.get(kind, 0)
 
 
 def _by_pass(by_dir: dict[str, list[dict]]) -> Table | None:
@@ -330,9 +397,10 @@ def _recurring(steps: list[dict], group: str, limit: int) -> Table | None:
 
 def _mapping(steps: list[dict]) -> Table | None:
     wit = [s for s in steps if s["witnesses"]]
-    unm = [s for s in steps if s["unmapped"]]
+    unm = [s for s in steps if _witness_failed(s)]
+    look = [s for s in steps if "lookup-only" in s.get("unmapped_reasons", {}).values()]
     err = [s for s in steps if s["error"]]
-    if not (wit or unm or err):
+    if not (wit or unm or look or err):
         return None
     t = Table(title="Mapping (Step A)", title_justify="left", box=box.SIMPLE_HEAD)
     t.add_column("What")
@@ -347,13 +415,26 @@ def _mapping(steps: list[dict]) -> Table | None:
         _where(wit),
     )
     t.add_row(
-        Text("unmapped (search failed)", style="red"),
+        Text("unmapped (witness search failed)", style="red"),
         str(len(unm)),
-        str(sum(len(s["unmapped"]) for s in unm)),
+        str(sum(_n_unmapped(s, lookup_only=False) for s in unm)),
         _where(unm),
+    )
+    t.add_row(
+        Text("unmapped (lookup-only, no definition)", style="yellow"),
+        str(len(look)),
+        str(sum(_n_unmapped(s, lookup_only=True) for s in look)),
+        _where(look),
     )
     t.add_row(Text("missing definition", style="red"), str(len(err)), "-", _where(err))
     return t
+
+
+def _n_unmapped(s: dict, lookup_only: bool) -> int:
+    reasons = s.get("unmapped_reasons")
+    if reasons is None:  # format 1
+        return 0 if lookup_only else len(s["unmapped"])
+    return sum((r == "lookup-only") == lookup_only for r in reasons.values())
 
 
 def _where(rs: list[dict], n: int = 4) -> str:
@@ -383,8 +464,9 @@ def _examples(steps: list[dict], per_reason: int) -> Table | None:
     seen: dict[str, list] = defaultdict(list)
     for s in steps:
         for e in s["examples"]:
-            if len(seen[e["reason"]]) < per_reason:
-                seen[e["reason"]].append((s, e))
+            label = _label(e.get("kind", "constraint"), e["reason"])
+            if len(seen[label]) < per_reason:
+                seen[label].append((s, e))
     if not seen:
         return None
     t = Table(
@@ -427,9 +509,10 @@ def render(
                 style="dim",
             )
         )
+    kinds = [k for k in KINDS if _has_kind(steps, k)]
     parts = [
         _outcomes(by_dir),
-        _obligations(by_dir),
+        *[_obligations(by_dir, k) for k in kinds],
         _by_pass(by_dir),
         _recurring(steps, meta.get("group", "<group>"), top),
         _mapping(steps),
