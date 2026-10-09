@@ -33,6 +33,9 @@ def _build_parser() -> argparse.ArgumentParser:
     c.add_argument(
         "--no-ranges", action="store_true", help="drop the byte-range premises"
     )
+    c.add_argument(
+        "--no-hints", action="store_true", help="ignore powdr's substitutions as hints"
+    )
     c.add_argument("--root", type=Path, help="dump root (default: powdr-dumps)")
     c.add_argument("--json", action="store_true", help="machine-readable output")
     c.add_argument("-v", "--verbose", action="store_true", help="list every obligation")
@@ -43,6 +46,9 @@ def _build_parser() -> argparse.ArgumentParser:
     s.add_argument("--direction", choices=("both",) + DIRECTIONS, default="both")
     s.add_argument(
         "--no-ranges", action="store_true", help="drop the byte-range premises"
+    )
+    s.add_argument(
+        "--no-hints", action="store_true", help="ignore powdr's substitutions as hints"
     )
     s.add_argument("--root", type=Path, help="dump root (default: powdr-dumps)")
     s.add_argument("--save", type=Path, help="also write the results as JSON")
@@ -85,6 +91,8 @@ def _as_dict(r: Report) -> dict:
         "counts": {kind: dict(r.counts(kind)) for kind in ("constraint", "bus")},
         "premises_expanded": r.premises_expanded,
         "premises_split": r.premises_split,
+        "hints_accepted": r.hints_accepted,
+        "hints_rejected": r.hints_rejected,
         "witnesses": [
             {"columns": cols, "witness": w} for cols, w in r.mapping.witnesses
         ],
@@ -106,7 +114,8 @@ def _print(r: Report, verbose: bool) -> None:
         if c
     )
     print(
-        f"{r.direction}: {status}  ({counts}; {r.premises_expanded} premises expanded, {r.premises_split} split)"
+        f"{r.direction}: {status}  ({counts}; {r.premises_expanded} premises expanded, {r.premises_split} split"
+        f"; hints {r.hints_accepted} used, {r.hints_rejected} rejected)"
     )
     for cols, w in r.mapping.witnesses:
         print(f"  witness  {', '.join(cols)} := {json.dumps(w)}")
@@ -139,6 +148,7 @@ def _sweep(args, directions) -> int:
             not args.no_ranges,
             args.root,
             on_block=progress,
+            use_hints=not args.no_hints,
         )
     if args.save:
         args.save.write_text(json.dumps(data))
@@ -174,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
             directions,
             not args.no_ranges,
             args.root,
+            not args.no_hints,
         )
     except (ResolveError, FileNotFoundError, MissingDefinition) as exc:
         print(f"redesign: {type(exc).__name__}: {exc}", file=sys.stderr)

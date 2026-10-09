@@ -3,9 +3,18 @@
 - P: premises, polynomials each read as "= 0".
 - R: ranges lo <= x <= hi on the integer representative of a variable.
 - Defs: definitions for variables that are not declared.
+- Solved: equations x = t for declared x, each checked when added (add_solved).
 
 The answer is ``Implied`` (with a reason) or ``Unknown``. There is no
 "not implied": Unknown only means no rule applied.
+
+Solved equations. A premise is trusted; a solved equation is not: add_solved
+first checks that x = t follows from what is already known, exactly as a
+query would be checked. Only then is x replaced by t, in the premises (as
+the rules see them) and in every later query. The caller picks which
+equations to try and in what order (e.g. the substitutions powdr recorded);
+the solver only checks them. Defs differ: they name fresh variables, so they
+need no check, and no premise can mention them.
 
 Rules, cheapest first:
 - N (normalize): q has the same zero key as one premise.
@@ -40,6 +49,9 @@ class Implied:
     premises: tuple[str, ...] = ()  # tags of the premises used
     ranges: tuple[str, ...] = ()  # variables whose ranges were used
     defs: tuple[str, ...] = ()  # defined variables that occur in q
+    # Tags of the solved equations that rewrote q or the premises used. Each
+    # was itself checked when it was added (and may rest on earlier ones).
+    solved: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -59,6 +71,9 @@ class _Premise:
 
     tag: str  # the caller's name for it, reported back in verdicts
     expr: Expr  # the expression exactly as given
+    # Everything below is derived from expr under the solved equations, and
+    # recomputed when they change (version differs from the solver's).
+    version: int = 0
     key: P.Key | None = None  # zero key; None until computed, or if too big
     expanded: bool = False  # True once we tried to compute the key
     # Rule S's view, computed on first use: the top-level factors as written,
@@ -91,8 +106,18 @@ class PolySolver:
         # premises grow; Unknown may not, so that cache is cleared on every add.
         self._implied: dict[P.Key, Implied] = {}
         self._unknown: dict[P.Key, Unknown] = {}
+        # Solved equations x = t (add_solved). t is kept fully reduced: it never
+        # mentions a solved variable, so one lookup replaces x for good.
+        self._solved: dict[Var, P.Poly] = {}
+        self._solved_tag: dict[Var, str] = {}
+        # Variable -> solved variables whose t mentions it (for back-substitution
+        # and for finding premises that mention a variable only through t).
+        # May list a few extra after cancellations; that costs only time.
+        self._occurs_in: dict[Var, set[Var]] = defaultdict(set)
+        self._version = 0  # bumped on every add_solved; stales premise caches
         self.premises_expanded = 0  # premise keys computed (rule N)
         self.premises_split = 0  # premises split into factors (rule S)
+        self.solved_rejected = 0  # add_solved calls whose check failed
 
     # ------------------------------------------------------------ inputs
 
@@ -122,6 +147,65 @@ class PolySolver:
         self._ranges[v] = (lo, hi, tags)
         self._unknown.clear()
 
+    def add_solved(self, x: str, t: Expr, tag: str) -> Verdict:
+        """Check that ``x = t`` is implied; if so, replace x by t from now on.
+
+        x must be declared and not yet solved. The check is an ordinary query
+        of x - t against the current state. On Implied, x is replaced by t in
+        the premises (as the rules see them), in earlier solved equations and
+        in all later queries. On Unknown nothing changes: the equation is
+        rejected, which costs completeness only.
+        """
+        (xv,) = self._declared_vars(x, "solved variable")
+        self._declared_vars(t, "solved value")
+        if xv in self._solved:
+            return self._reject(f"{x} is already solved", "already-solved")
+        try:
+            rhs = P.expand(t, self._plain, self.p, self.max_terms)
+        except P.ExpansionLimit:
+            return self._reject("expansion limit", "expansion-limit")
+        # t must not mention x, or "replace x by t" would not remove x.
+        if xv in P.variables_of(rhs):
+            return self._reject(f"{x} occurs in its own value", "not-solved")
+        k = P.zkey(P.add(P.var_poly(xv), rhs, self.p, -1), self.p)
+        verdict = self._decide(k)
+        if not isinstance(verdict, Implied):
+            return self._reject(verdict.note, verdict.kind)
+        # Accepted. Earlier solved values that mention x get x replaced too,
+        # so every value stays free of solved variables. Compute them all
+        # before changing anything, so an expansion limit leaves no trace.
+        def by_rhs(v: Var) -> P.Poly | None:
+            return rhs if v == xv else None
+
+        try:
+            updated = {
+                y: P.substitute(self._solved[y], by_rhs, self.p, self.max_terms)
+                for y in self._occurs_in.get(xv, ())
+            }
+        except P.ExpansionLimit:
+            return self._reject("expansion limit (back-substitution)", "expansion-limit")
+        self._occurs_in.pop(xv, None)
+        for y, value in updated.items():
+            self._solved[y] = value
+            for v in P.variables_of(value):
+                self._occurs_in[v].add(y)
+        self._solved[xv] = rhs
+        self._solved_tag[xv] = tag
+        for v in P.variables_of(rhs):
+            self._occurs_in[v].add(xv)
+        self._version += 1  # premise keys and splits are now stale
+        self._unknown.clear()  # an earlier Unknown might now be provable
+        return verdict
+
+    def _reject(self, note: str, kind: str) -> Unknown:
+        self.solved_rejected += 1
+        return Unknown(note, kind)
+
+    @property
+    def solved_count(self) -> int:
+        """Number of accepted solved equations."""
+        return len(self._solved)
+
     def make_defs(self, mapping: dict[str, Expr | Opaque]) -> Defs:
         """Validate definitions (D1 fresh, D2 flat, D3 polynomial or opaque)."""
         polys, opaque = {}, set()
@@ -135,8 +219,10 @@ class PolySolver:
             for n in variables(rhs):  # raises UnsupportedExpr outside the grammar
                 if self._var(n) not in self.declared:  # also rules out chains
                     raise InvalidDefs(f"D2: {name} := ... mentions undeclared {n}")
+            # Stored as written: implies applies the solved equations on use,
+            # so the Defs stay valid when more equations are solved later.
             try:
-                polys[v] = P.expand(rhs, self._plain, self.p, self.max_terms)
+                polys[v] = P.expand(rhs, self._as_written, self.p, self.max_terms)
             except P.ExpansionLimit:
                 polys[v] = None  # queries through v report the limit
         return Defs(polys, frozenset(opaque), id(self.table))
@@ -162,14 +248,15 @@ class PolySolver:
             return Unknown(f"opaque: {', '.join(opaque)}", "opaque")
 
         # Expansion resolves each defined variable to its cached definition,
-        # so q[Defs] is never built as an expression.
+        # so q[Defs] is never built as an expression. Declared variables go
+        # through the solved equations, and so do the definitions' values.
         def lookup(n: str) -> P.Poly:
             v = self._var(n)
             if v in defs.polys:
                 if defs.polys[v] is None:
                     raise P.ExpansionLimit
-                return defs.polys[v]
-            return P.var_poly(v)
+                return self._reduce(defs.polys[v])
+            return self._plain(n)
 
         try:
             k = P.zkey(P.expand(q, lookup, self.p, self.max_terms), self.p)
@@ -184,9 +271,25 @@ class PolySolver:
                 verdict
             )
         if isinstance(verdict, Implied):
-            # The cached verdict is shared; report this query's own definitions.
-            return Implied(verdict.rule, verdict.premises, verdict.ranges, tuple(used))
+            # The cached verdict is shared; report this query's own definitions
+            # and the solved equations that rewrote q (directly or via a Def).
+            mine = self._solved_tags(self._q_vars(names, defs))
+            solved = tuple(sorted(set(verdict.solved) | set(mine)))
+            return Implied(
+                verdict.rule, verdict.premises, verdict.ranges, tuple(used), solved
+            )
         return verdict
+
+    def _q_vars(self, names: set[str], defs: Defs) -> set[Var]:
+        """Declared variables of q, including those inside the Defs it uses."""
+        out = set()
+        for n in names:
+            v = self._var(n)
+            if v in self.declared:
+                out.add(v)
+            elif defs.polys.get(v):
+                out |= P.variables_of(defs.polys[v])
+        return out
 
     def _decide(self, k: P.Key) -> Verdict:
         """Try the rules in order, cheapest first; the first Implied wins."""
@@ -208,18 +311,45 @@ class PolySolver:
             return Implied("trivial")
         if P.is_constant(k):
             return Unknown("N: nonzero constant", "nonzero-constant")
-        # Expansion only removes variables, so a premise with key k mentions
-        # every variable of k syntactically: looking up one of them is enough.
+        # A premise with key k mentions every variable of k, directly or through
+        # a solved value (_mentioning): looking up one of them is enough.
         # Pick the rarest one, so we expand as few premises as possible.
-        v = min(P.key_vars(k), key=lambda x: len(self._by_var.get(x, ())))
-        for i in self._by_var.get(v, ()):
+        v = min(P.key_vars(k), key=lambda x: len(self._mentioning(x)))
+        for i in self._mentioning(v):
             if self._premise_key(i) == k:
-                return Implied("normalize", (self._premises[i].tag,))
+                prem = self._premises[i]
+                return Implied(
+                    "normalize", (prem.tag,), solved=self._solved_tags_of(prem.expr)
+                )
         return Unknown("N: no premise with this normal form")
+
+    def _mentioning(self, v: Var) -> list[int]:
+        """Premises whose key (under the solved equations) can mention v.
+
+        Expansion only removes variables, so such a premise mentions v as
+        written, or mentions a solved y whose value mentions v. Solved values
+        are fully reduced, so one level of _occurs_in is enough.
+        """
+        ids = self._by_var.get(v, [])
+        via = self._occurs_in.get(v)
+        if not via:
+            return ids
+        out = set(ids)
+        for y in via:
+            out.update(self._by_var.get(y, ()))
+        return sorted(out)
+
+    def _fresh(self, prem: _Premise) -> _Premise:
+        """Drop the premise's derived data if solved equations changed since."""
+        if prem.version != self._version:
+            prem.version = self._version
+            prem.key, prem.expanded = None, False
+            prem.factors, prem.polys, prem.sums = None, {}, None
+        return prem
 
     def _premise_key(self, i: int) -> P.Key | None:
         """The premise's zero key, expanded on first use and then cached."""
-        prem = self._premises[i]
+        prem = self._fresh(self._premises[i])
         if not prem.expanded:
             prem.expanded = True
             self.premises_expanded += 1
@@ -240,7 +370,7 @@ class PolySolver:
         looks at are ever split. Each factor is fully expanded, so a factor that
         becomes a sum only after cancellation (x*y - x*y + a + b) is still found.
         """
-        prem = self._premises[i]
+        prem = self._fresh(self._premises[i])
         if prem.sums is None:
             self.premises_split += 1
             prem.factors = product_factors(prem.expr)
@@ -280,11 +410,12 @@ class PolySolver:
         for a in sorted(P.key_vars(k)):
             if a not in self._ranges:  # an unranged a can never pass the bound
                 continue
-            # A premise whose sum contains a mentions a syntactically, so the
-            # premise index finds every candidate (as in rule N).
-            for idx in self._by_var.get(a, ()):
+            # A premise whose sum contains a mentions a, directly or through a
+            # solved value, so _mentioning finds every candidate (as in rule N).
+            for idx in self._mentioning(a):
+                sums = self._premise_sums(idx)
                 prem = self._premises[idx]
-                for fi, s in self._premise_sums(idx):
+                for fi, s in sums:
                     if ((a, 1),) not in s:
                         continue
                     g = self._other_factors_times(prem, fi, a)
@@ -299,7 +430,12 @@ class PolySolver:
                         continue
                     # Report every summand: all their ranges were used.
                     ranged = sorted(self.table.name(v) for ((v, _),) in s)
-                    return Implied("nowrap-split", (prem.tag,), tuple(ranged))
+                    return Implied(
+                        "nowrap-split",
+                        (prem.tag,),
+                        tuple(ranged),
+                        solved=self._solved_tags_of(prem.expr),
+                    )
         return Unknown(
             "S: " + ("; ".join(notes) if notes else "no ranged sum premise"), kind
         )
@@ -343,8 +479,30 @@ class PolySolver:
             raise UndefinedVariable(str(exc)) from None
 
     def _plain(self, name: str) -> P.Poly:
-        """Lookup for expanding premises: a name is just its variable."""
+        """Lookup for expanding: a name is its variable, or its solved value."""
+        v = self._var(name)
+        if v in self._solved:
+            return self._solved[v]
+        return P.var_poly(v)
+
+    def _as_written(self, name: str) -> P.Poly:
+        """Lookup that ignores the solved equations: a name is its variable."""
         return P.var_poly(self._var(name))
+
+    def _reduce(self, a: P.Poly) -> P.Poly:
+        """``a`` with every solved variable replaced by its value."""
+        if not self._solved:
+            return a
+        return P.substitute(a, self._solved.get, self.p, self.max_terms)
+
+    def _solved_tags(self, vs) -> tuple[str, ...]:
+        return tuple(sorted(self._solved_tag[v] for v in vs if v in self._solved))
+
+    def _solved_tags_of(self, e: Expr) -> tuple[str, ...]:
+        """Tags of the solved equations that rewrite the expression ``e``."""
+        if not self._solved:
+            return ()
+        return self._solved_tags(self._var(n) for n in variables(e))
 
     def _declared_vars(self, e: Expr, what: str) -> list[Var]:
         """The Vars of ``e``; all must be declared (premises and ranges only)."""

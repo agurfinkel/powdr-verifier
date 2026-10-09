@@ -33,6 +33,7 @@ def run_sweep(
     use_ranges: bool = True,
     root: Path | None = None,
     on_block: Callable[[str, list[dict]], None] | None = None,
+    use_hints: bool = True,
 ) -> dict:
     """Sweep the blocks (default: all) and return ``{"meta": ..., "steps": [...]}``."""
     directory = group_dir(group, root or POWDR_DUMPS_DIR)
@@ -57,14 +58,19 @@ def run_sweep(
             }
             try:
                 reports = check_step(
-                    circuits[i], circuits[i + 1], subs, directions, use_ranges
+                    circuits[i], circuits[i + 1], subs, directions, use_ranges, use_hints
                 )
             except MissingDefinition as exc:
                 # Only completeness raises; still record soundness separately.
                 records.append(_error(base, "completeness", str(exc)))
                 if "soundness" in directions:
                     (r,) = check_step(
-                        circuits[i], circuits[i + 1], subs, ("soundness",), use_ranges
+                        circuits[i],
+                        circuits[i + 1],
+                        subs,
+                        ("soundness",),
+                        use_ranges,
+                        use_hints,
                     )
                     records.append(_record(base, r))
                 continue
@@ -78,6 +84,7 @@ def run_sweep(
         "blocks": len(blocks),
         "directions": list(directions),
         "byte_ranges": use_ranges,
+        "hints": use_hints,
         "seconds": round(time.monotonic() - start, 1),
         "created": datetime.now().astimezone().isoformat(timespec="seconds"),
         "verifier_commit": _commit(),
@@ -111,6 +118,8 @@ def _record(base: dict, r: Report) -> dict:
         "cached_by_kind": dict(Counter(o.kind for o in r.obligations if o.cached)),
         "premises_expanded": r.premises_expanded,
         "premises_split": r.premises_split,
+        "hints_accepted": r.hints_accepted,
+        "hints_rejected": r.hints_rejected,
         "witnesses": [[cols, w] for cols, w in r.mapping.witnesses],
         "unmapped": sorted(r.mapping.unmapped),
         "unmapped_reasons": dict(sorted(r.mapping.unmapped_reason.items())),
@@ -131,6 +140,8 @@ def _error(base: dict, direction: str, msg: str) -> dict:
         "cached_by_kind": {},
         "premises_expanded": 0,
         "premises_split": 0,
+        "hints_accepted": 0,
+        "hints_rejected": 0,
         "witnesses": [],
         "unmapped": [],
         "unmapped_reasons": {},

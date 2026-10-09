@@ -121,6 +121,31 @@ def expand(
     raise UnsupportedExpr(f"not an expression: {e!r}")
 
 
+def substitute(
+    a: Poly, sub: Callable[[int], Poly | None], p: int, limit: int = MAX_TERMS
+) -> Poly:
+    """``a`` with each variable v replaced by ``sub(v)`` (kept as is if None)."""
+    out: Poly = {}
+    for m, c in a.items():
+        term: Poly = {(): c}
+        for v, e in m:
+            f = sub(v)
+            if f is None:
+                term = mul(term, {((v, e),): 1}, p, limit)
+                continue
+            for _ in range(e):
+                term = mul(term, f, p, limit)
+        out = add(out, term, p)
+        if len(out) > limit:
+            raise ExpansionLimit
+    return out
+
+
+def variables_of(a: Poly) -> set[int]:
+    """The variables that occur in a polynomial."""
+    return {v for m in a for v, _ in m}
+
+
 def degree(m: Mono) -> int:
     """Total degree: x^2 y has degree 3, a constant has degree 0."""
     return sum(e for _, e in m)

@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
-from src.polysolver import PolySolver, VarTable
+from src.polysolver import Expr, PolySolver, VarTable
 
 from .circuit import Circuit, byte_ranges
 
 
 def reference_solver(
-    table: VarTable, ref: Circuit, use_ranges: bool = True
+    table: VarTable,
+    ref: Circuit,
+    use_ranges: bool = True,
+    hints: list[tuple[str, Expr]] = (),
 ) -> PolySolver:
-    """Premises and ranges from the reference side only (the polarity rule)."""
+    """Premises and ranges from the reference side only (the polarity rule).
+
+    ``hints`` are candidate solved equations x = t over reference columns,
+    tried in order. The solver checks each one and keeps only those that
+    follow from what it already knows; a rejected hint costs completeness only.
+    """
     s = PolySolver(table, declared=ref.columns)
     for i, c in enumerate(ref.constraints):
         s.add_premise(c, tag=f"{ref.label}:c{i}")
     if use_ranges:
         for x, lo, hi in byte_ranges(ref):
             s.add_range(x, lo, hi, tag=f"{ref.label}:bytes:{x}")
+    for x, t in hints:
+        s.add_solved(x, t, tag=f"hint:{x}")
     return s
