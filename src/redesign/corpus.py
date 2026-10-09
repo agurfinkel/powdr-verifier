@@ -34,6 +34,7 @@ def run_sweep(
     root: Path | None = None,
     on_block: Callable[[str, list[dict]], None] | None = None,
     use_hints: bool = True,
+    use_constants: bool = True,
 ) -> dict:
     """Sweep the blocks (default: all) and return ``{"meta": ..., "steps": [...]}``."""
     directory = group_dir(group, root or POWDR_DUMPS_DIR)
@@ -58,7 +59,13 @@ def run_sweep(
             }
             try:
                 reports = check_step(
-                    circuits[i], circuits[i + 1], subs, directions, use_ranges, use_hints
+                    circuits[i],
+                    circuits[i + 1],
+                    subs,
+                    directions,
+                    use_ranges,
+                    use_hints,
+                    use_constants,
                 )
             except MissingDefinition as exc:
                 # Only completeness raises; still record soundness separately.
@@ -71,6 +78,7 @@ def run_sweep(
                         ("soundness",),
                         use_ranges,
                         use_hints,
+                        use_constants,
                     )
                     records.append(_record(base, r))
                 continue
@@ -85,6 +93,7 @@ def run_sweep(
         "directions": list(directions),
         "byte_ranges": use_ranges,
         "hints": use_hints,
+        "constants": use_constants,
         "seconds": round(time.monotonic() - start, 1),
         "created": datetime.now().astimezone().isoformat(timespec="seconds"),
         "verifier_commit": _commit(),
@@ -120,6 +129,7 @@ def _record(base: dict, r: Report) -> dict:
         "premises_split": r.premises_split,
         "hints_accepted": r.hints_accepted,
         "hints_rejected": r.hints_rejected,
+        "constants_solved": r.constants_solved,
         "witnesses": [[cols, w] for cols, w in r.mapping.witnesses],
         "unmapped": sorted(r.mapping.unmapped),
         "unmapped_reasons": dict(sorted(r.mapping.unmapped_reason.items())),
@@ -142,6 +152,7 @@ def _error(base: dict, direction: str, msg: str) -> dict:
         "premises_split": 0,
         "hints_accepted": 0,
         "hints_rejected": 0,
+        "constants_solved": 0,
         "witnesses": [],
         "unmapped": [],
         "unmapped_reasons": {},

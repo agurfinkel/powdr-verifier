@@ -36,6 +36,7 @@ def check_step(
     directions=DIRECTIONS,
     use_ranges: bool = True,
     use_hints: bool = True,
+    use_constants: bool = True,
 ) -> list[Report]:
     """Completeness: Before is the reference. Soundness: After is."""
     table = VarTable()  # one per step, shared by both directions
@@ -44,11 +45,11 @@ def check_step(
         # Completeness only: the hints are about Before's columns. In the
         # soundness direction the same substitutions already define w.
         hints = step_hints(before, after, subs) if use_hints else []
-        solver = reference_solver(table, before, use_ranges, hints)
+        solver = reference_solver(table, before, use_ranges, hints, use_constants)
         m = completeness_mapping(before, after, subs)
         reports.append(sweep("completeness", before, after, m, solver))
     if "soundness" in directions:
-        solver = reference_solver(table, after, use_ranges)
+        solver = reference_solver(table, after, use_ranges, constants=use_constants)
         m = soundness_mapping(after, before, subs, solver) # <- Polysolver used to find missing witnesses
         reports.append(sweep("soundness", after, before, m, solver))
     return reports
@@ -63,8 +64,11 @@ def check(
     use_ranges: bool = True,
     root: Path | None = None,
     use_hints: bool = True,
+    use_constants: bool = True,
 ) -> list[Report]:
     before = load_step(group, block, step_from, root)
     after = load_step(group, block, step_to, root)
     subs = load_substitutions(group, block, root)
-    return check_step(before, after, subs, directions, use_ranges, use_hints)
+    return check_step(
+        before, after, subs, directions, use_ranges, use_hints, use_constants
+    )

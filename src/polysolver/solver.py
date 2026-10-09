@@ -16,6 +16,10 @@ equations to try and in what order (e.g. the substitutions powdr recorded);
 the solver only checks them. Defs differ: they name fresh variables, so they
 need no check, and no premise can mention them.
 
+The one kind of equation the solver finds by itself is a constant: a premise
+that, under the solved equations, mentions one variable linearly pins it.
+solve_constants adds all of them, propagating, when the caller asks.
+
 Rules, cheapest first:
 - N (normalize): q has the same zero key as one premise.
 - S (no-wrap split): a premise G * (c1*a1 + ... + cn*an) with ranged a_i whose
@@ -118,6 +122,7 @@ class PolySolver:
         self.premises_expanded = 0  # premise keys computed (rule N)
         self.premises_split = 0  # premises split into factors (rule S)
         self.solved_rejected = 0  # add_solved calls whose check failed
+        self.constants_solved = 0  # equations added by solve_constants
 
     # ------------------------------------------------------------ inputs
 
@@ -196,6 +201,53 @@ class PolySolver:
         self._version += 1  # premise keys and splits are now stale
         self._unknown.clear()  # an earlier Unknown might now be provable
         return verdict
+
+    def solve_constants(self) -> int:
+        """Solve every premise that pins one variable to a constant; return how many.
+
+        A premise that, under the solved equations, is c*x + k (one variable,
+        degree 1, c a nonzero constant) gives x := -k/c. Each new constant can
+        turn more premises into such pins (pc1 - pc0 - 4 once pc0 is known), so
+        the premises that mention x are looked at again, until none gives a new
+        one. Like z3's solve-eqs restricted to constant values, but only when the
+        caller asks. Every equation goes through add_solved, so it is checked
+        like any other; the premise it came from is its tag.
+        """
+        added = 0
+        todo = list(range(len(self._premises)))
+        queued = set(todo)
+        while todo:
+            i = todo.pop()
+            queued.discard(i)
+            pin = self._as_pin(self._premise_key(i))
+            if pin is None:
+                continue
+            xv, value = pin
+            x = self.table.name(xv)
+            # Look again at what mentions x, computed before x is replaced.
+            again = self._mentioning(xv)
+            if isinstance(self.add_solved(x, value, tag=self._premises[i].tag), Implied):
+                added += 1
+                self.constants_solved += 1
+                for j in again:
+                    if j not in queued:
+                        queued.add(j)
+                        todo.append(j)
+        return added
+
+    @staticmethod
+    def _as_pin(k: P.Key | None) -> tuple[Var, int] | None:
+        """(x, value) if the zero key says x = value, else None."""
+        if not k:
+            return None
+        lead, c = k[0]  # monic: the leading term has coefficient 1
+        if len(lead) != 1 or lead[0][1] != 1 or c != 1:
+            return None
+        rest = k[1:]
+        if any(m != () for m, _ in rest):
+            return None
+        value = -rest[0][1] if rest else 0
+        return lead[0][0], value
 
     def _reject(self, note: str, kind: str) -> Unknown:
         self.solved_rejected += 1

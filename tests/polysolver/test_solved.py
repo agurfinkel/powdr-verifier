@@ -104,3 +104,36 @@ def test_gated_premise_becomes_usable():
     assert isinstance(s.implies(L), Unknown)
     assert isinstance(s.add_solved("f1", sub(1, "f2"), tag="h:f1"), Implied)
     assert s.implies(L).rule == "normalize"
+
+
+# ---------------------------------------------------------------- constants
+
+def test_solve_constants_propagates():
+    # pc0 is pinned; pc1 - pc0 - 4 becomes a pin once pc0 is known.
+    s = solver({"pc0", "pc1"}, [sub("pc1", add("pc0", 4)), sub("pc0", 100)])
+    assert s.solve_constants() == 2
+    v = s.implies(sub("pc1", 104))
+    # Provenance is direct: pc1's equation (from p0), which itself rested on pc0's.
+    assert v.rule == "trivial" and v.solved == ("p0",)
+
+
+def test_solve_constants_scales_and_zero():
+    s = solver({"x", "y"}, [sub(mul(3, "x"), 12), mul(5, "y")])  # 3x = 12, 5y = 0
+    assert s.solve_constants() == 2
+    assert s.implies(sub("x", 4)).rule == "trivial"
+    assert s.implies("y").rule == "trivial"
+
+
+def test_solve_constants_leaves_the_rest():
+    # Two variables, a square, a product: none of them pins a variable.
+    s = solver({"x", "y", "z"}, [sub("x", "y"), mul("z", sub("z", 1)), mul("x", "y")])
+    assert s.solve_constants() == 0 and s.solved_count == 0
+
+
+def test_solve_constants_after_hints():
+    # The hint makes p1 a pin: y - x - 1 with x := 2 becomes y - 3.
+    s = solver({"x", "y"}, [sub("x", 2), sub("y", add("x", 1))])
+    assert isinstance(s.add_solved("x", 2, tag="h:x"), Implied)
+    assert s.solve_constants() == 1
+    assert s.implies(sub("y", 3)).rule == "trivial"
+    assert s.solved_rejected == 0
