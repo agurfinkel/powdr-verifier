@@ -82,27 +82,41 @@ def _as_dict(r: Report) -> dict:
     return {
         "direction": r.direction,
         "verified": r.verified,
-        "counts": dict(r.counts()),
+        "counts": {kind: dict(r.counts(kind)) for kind in ("constraint", "bus")},
         "premises_expanded": r.premises_expanded,
         "premises_split": r.premises_split,
         "witnesses": [
             {"columns": cols, "witness": w} for cols, w in r.mapping.witnesses
         ],
         "unmapped": sorted(r.mapping.unmapped),
+        "unmapped_reasons": dict(sorted(r.mapping.unmapped_reason.items())),
         "obligations": [vars(o) for o in r.obligations],
     }
 
 
 def _print(r: Report, verbose: bool) -> None:
     status = "verified" if r.verified else "NOT verified"
-    counts = ", ".join(f"{k} {v}" for k, v in sorted(r.counts().items()))
+    # One group of rung counts per kind: constraints, then stateless lookups.
+    counts = "; ".join(
+        f"{label}: " + ", ".join(f"{k} {v}" for k, v in sorted(c.items()))
+        for label, c in (
+            ("constraints", r.counts("constraint")),
+            ("bus", r.counts("bus")),
+        )
+        if c
+    )
     print(
         f"{r.direction}: {status}  ({counts}; {r.premises_expanded} premises expanded, {r.premises_split} split)"
     )
     for cols, w in r.mapping.witnesses:
         print(f"  witness  {', '.join(cols)} := {json.dumps(w)}")
-    if r.mapping.unmapped:
-        print(f"  unmapped {', '.join(sorted(r.mapping.unmapped))}")
+    # Unmapped columns, grouped by why: a failed witness search or lookup-only.
+    by_reason: dict[str, list[str]] = {}
+    for col in sorted(r.mapping.unmapped):
+        why = r.mapping.unmapped_reason.get(col, "witness search failed")
+        by_reason.setdefault(why, []).append(col)
+    for why, cols in by_reason.items():
+        print(f"  unmapped ({why}) {', '.join(cols)}")
     for o in r.obligations:
         if verbose or o.rung == "undecided":
             print(f"  {o.rung:<12} {o.name}  {o.detail}")

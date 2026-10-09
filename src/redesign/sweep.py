@@ -1,4 +1,4 @@
-"""Step B: one obligation per candidate constraint, discharged up a ladder.
+"""Step B: one obligation per candidate constraint or stateless interaction.
 
 For a candidate constraint c the obligation is c[w]: it must follow from the
 reference side's constraints and byte ranges. The rungs, cheapest first:
@@ -8,9 +8,16 @@ reference side's constraints and byte ranges. The rungs, cheapest first:
   normalize / nowrap-split - PolySolver proves it
   undecided  - nothing applied; left for the SMT rungs (not built yet)
 
+A stateless bus interaction (a lookup) is the fact "mult != 0 => args in
+table". Its obligation I[w] is discharged by canonical rungs only, for now:
+
+  trivial    - mult[w] is zero, so the lookup asserts nothing
+  identical  - the reference has an interaction with the same bus, mult and
+               args (lens's _bus_exact_key), so it already asserts this fact
+
 Results are cached by canonical key. A direction is verified only if no
-obligation is undecided. "Verified" covers the algebraic constraints only:
-bus interactions are not checked yet.
+obligation is undecided. Stateful buses (memory, execution bridge) are not
+checked yet, so "verified" is not yet "equivalent".
 """
 
 from __future__ import annotations
@@ -18,7 +25,8 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field, replace
 
-from src.lens.canon import CanonError, canon_zero
+from src.lens.canon import CanonError, canon_value, canon_zero
+from src.lens.diff import _bus_exact_key
 from src.polysolver import (
     BABYBEAR,
     Expr,
@@ -30,7 +38,7 @@ from src.polysolver import (
     variables,
 )
 
-from .circuit import Circuit, substitute
+from .circuit import Circuit, interaction_columns, substitute, substitute_interaction
 from .mapping import Mapping
 
 # Rungs that prove an obligation; anything else is "undecided".
@@ -39,9 +47,11 @@ DISCHARGED = ("trivial", "identical", "normalize", "nowrap-split")
 
 @dataclass(frozen=True)
 class Obligation:
-    """The verdict for one candidate constraint under the mapping."""
+    """The verdict for one candidate constraint or interaction under the mapping."""
 
-    name: str  # "<label>:c<i>", or "<column>:def<i>" for an extra definition
+    # "<label>:c<i>" (constraint), "<label>:b<i>" (i-th stateless interaction),
+    # or "<column>:def<i>" for an extra definition.
+    name: str
     rung: str  # one of DISCHARGED, or "undecided"
     detail: str = ""  # premises used, or why it is undecided
     cached: bool = False  # answered from an identical earlier obligation
@@ -49,6 +59,7 @@ class Obligation:
     reason: str = ""
     # True if c mentions a column defined by the mapping, so c[w] differs from c.
     via_mapping: bool = False
+    kind: str = "constraint"  # or "bus" for a stateless bus interaction
 
 
 # Why an obligation can stay undecided. Fixed strings, so reports can group them.
@@ -68,6 +79,14 @@ REASONS = {
     "linear, no match": "linear; may follow from a combination of reference"
     " constraints (elimination rule not built)",
     "nonlinear, no match": "nonlinear; needs several premises or SMT",
+    # Stateless bus interactions (canonical rungs only, so far).
+    "lookup-only column": "mentions a candidate column used only by lookups, with"
+    " no definition (e.g. a dropped range check); needs table semantics",
+    "bus: no same-mult reference": "no reference interaction on this bus has the"
+    " same multiplicity",
+    "bus: args differ": "reference interactions with this bus and multiplicity"
+    " exist, but none has the same args",
+    "bus: not canonical": "lens could not canonicalize the interaction",
 }
 
 
@@ -83,28 +102,28 @@ class Report:
 
     @property
     def verified(self) -> bool:
-        """Every obligation discharged and every column mapped (algebraic part only)."""
+        """Every obligation discharged and every column mapped (stateful buses not checked)."""
         return (
             all(o.rung in DISCHARGED for o in self.obligations)
             and not self.mapping.unmapped
         )
 
-    def counts(self) -> Counter:
-        """Counts by rung."""
-        return Counter(o.rung for o in self.obligations)
+    def counts(self, kind: str | None = None) -> Counter:
+        """Counts by rung, for one kind of obligation or all of them."""
+        return Counter(o.rung for o in self.obligations if kind in (None, o.kind))
 
     def categories(self) -> Counter:
-        """Counts by (rung, subcategory)."""
+        """Counts by (kind, rung, subcategory)."""
         return Counter(category(o) for o in self.obligations)
 
 
-def category(o: Obligation) -> tuple[str, str]:
-    """(rung, subcategory): the undecided reason, or whether the mapping was used."""
+def category(o: Obligation) -> tuple[str, str, str]:
+    """(kind, rung, subcategory): the undecided reason, or whether the mapping was used."""
     if o.rung == "undecided":
-        return o.rung, o.reason
+        return o.kind, o.rung, o.reason
     if o.rung == "trivial":
-        return o.rung, ""
-    return o.rung, "via mapping" if o.via_mapping else "direct"
+        return o.kind, o.rung, ""
+    return o.kind, o.rung, "via mapping" if o.via_mapping else "direct"
 
 
 def sweep(
@@ -168,22 +187,70 @@ def sweep(
         ob = Obligation(name, "undecided", v.note, reason=reason, via_mapping=mapped)
         return _remember(cache, key, ob)
 
+    # Reference lookups, for the bus "identical" rung, and their (bus, mult)
+    # pairs, to tell "args differ" from "no same-mult reference" when undecided.
+    ref_bus_keys, ref_bus_mults = set(), set()
+    for r in ref.stateless:
+        try:
+            ref_bus_keys.add(_bus_exact_key(r))
+            ref_bus_mults.add((r["id"], canon_value(r["mult"])))
+        except CanonError:
+            pass  # cannot be matched; costs completeness only
+    bus_cache: dict = {}  # canonical key of I[w] -> its verdict
+
+    def check_bus(name: str, bi: dict) -> Obligation:
+        """Discharge one stateless interaction by canonical matching."""
+        cols = interaction_columns(bi)
+        mapped = bool(cols & mapping.defs.keys())
+        missing = cols & mapping.unmapped
+        if missing:
+            lookup_only = all(
+                mapping.unmapped_reason.get(c) == "lookup-only" for c in missing
+            )
+            reason = "lookup-only column" if lookup_only else "unmapped column"
+            detail = "unmapped: " + ", ".join(sorted(missing))
+            return Obligation(name, "undecided", detail, reason=reason, kind="bus")
+        # Opaque columns cannot be written into I, so there is no I[w] to match.
+        opaque = cols & blocked
+        if opaque:
+            detail = "opaque: " + ", ".join(sorted(opaque))
+            reason = _reason("opaque", cols, mapping)
+            return Obligation(name, "undecided", detail, reason=reason, kind="bus")
+        bw = substitute_interaction(bi, poly_defs)
+        try:
+            key, mult = _bus_exact_key(bw), canon_value(bw["mult"])
+        except CanonError as exc:
+            return Obligation(
+                name, "undecided", str(exc), reason="bus: not canonical", kind="bus"
+            )
+        # Rung 0: the same interaction was already decided in this step.
+        if key in bus_cache:
+            return replace(bus_cache[key], name=name, cached=True, via_mapping=mapped)
+        if mult == ():
+            # Rung 1: multiplicity 0, so the lookup asserts nothing.
+            ob = Obligation(name, "trivial", "multiplicity is 0", kind="bus")
+        elif key in ref_bus_keys:
+            # Rung 2: the reference asserts this very fact (same bus, mult, args).
+            ob = Obligation(name, "identical", via_mapping=mapped, kind="bus")
+        else:
+            same_mult = (bw["id"], mult) in ref_bus_mults
+            reason = "bus: args differ" if same_mult else "bus: no same-mult reference"
+            ob = Obligation(
+                name,
+                "undecided",
+                f"bus {bw['id']}",
+                reason=reason,
+                via_mapping=mapped,
+                kind="bus",
+            )
+        bus_cache[key] = ob
+        return ob
+
     for i, c in enumerate(cand.constraints):
         report.obligations.append(check(f"{cand.label}:c{i}", c))
-    # A column with several recipes was mapped by the first; each other recipe
-    # is a claim too: col - rhs must hold. Opaque ones cannot be checked here.
-    for i, (col, rhs) in enumerate(mapping.extra):
-        if isinstance(rhs, Opaque):
-            report.obligations.append(
-                Obligation(
-                    f"{col}:def{i + 1}",
-                    "undecided",
-                    "opaque definition",
-                    reason="opaque extra definition",
-                )
-            )
-        else:
-            report.obligations.append(check(f"{col}:def{i + 1}", [col, "-", rhs]))
+    for i, bi in enumerate(cand.stateless):
+        report.obligations.append(check_bus(f"{cand.label}:b{i}", bi))
+    
     report.premises_expanded = solver.premises_expanded
     report.premises_split = solver.premises_split
     return report

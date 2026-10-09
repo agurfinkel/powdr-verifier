@@ -22,7 +22,7 @@ from .circuit import Circuit, load_substitutions
 from .mapping import MissingDefinition
 from .sweep import Report
 
-FORMAT = 1
+FORMAT = 2  # 2: obligations have a kind (constraint / bus)
 EXAMPLES_PER_REASON = 2  # undecided obligations kept per step and reason
 
 
@@ -88,10 +88,15 @@ def run_sweep(
 def _record(base: dict, r: Report) -> dict:
     examples, seen = [], Counter()
     for o in r.obligations:
-        if o.rung == "undecided" and seen[o.reason] < EXAMPLES_PER_REASON:
-            seen[o.reason] += 1
+        if o.rung == "undecided" and seen[(o.kind, o.reason)] < EXAMPLES_PER_REASON:
+            seen[(o.kind, o.reason)] += 1
             examples.append(
-                {"reason": o.reason, "obligation": o.name, "detail": o.detail[:300]}
+                {
+                    "kind": o.kind,
+                    "reason": o.reason,
+                    "obligation": o.name,
+                    "detail": o.detail[:300],
+                }
             )
     return {
         **base,
@@ -99,13 +104,16 @@ def _record(base: dict, r: Report) -> dict:
         "verified": r.verified,
         "error": None,
         "obligations": len(r.obligations),
-        # "rung|subcategory" -> count; JSON keys must be strings.
-        "categories": {f"{k}|{s}": n for (k, s), n in r.categories().items()},
+        "obligations_by_kind": dict(Counter(o.kind for o in r.obligations)),
+        # "kind|rung|subcategory" -> count; JSON keys must be strings.
+        "categories": {"|".join(k): n for k, n in r.categories().items()},
         "cached": sum(o.cached for o in r.obligations),
+        "cached_by_kind": dict(Counter(o.kind for o in r.obligations if o.cached)),
         "premises_expanded": r.premises_expanded,
         "premises_split": r.premises_split,
         "witnesses": [[cols, w] for cols, w in r.mapping.witnesses],
         "unmapped": sorted(r.mapping.unmapped),
+        "unmapped_reasons": dict(sorted(r.mapping.unmapped_reason.items())),
         "examples": examples,
     }
 
@@ -117,12 +125,15 @@ def _error(base: dict, direction: str, msg: str) -> dict:
         "verified": False,
         "error": msg,
         "obligations": 0,
+        "obligations_by_kind": {},
         "categories": {},
         "cached": 0,
+        "cached_by_kind": {},
         "premises_expanded": 0,
         "premises_split": 0,
         "witnesses": [],
         "unmapped": [],
+        "unmapped_reasons": {},
         "examples": [],
     }
 
