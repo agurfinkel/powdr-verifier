@@ -59,7 +59,7 @@ def test_removed_constant_lookups_are_evaluated_except_pc_lookup():
     }
 
 
-def test_lookup_only_columns_skip_the_witness_search(monkeypatch):
+def test_lookup_only_columns_get_witness_zero(monkeypatch):
     calls = []
     real = mapping_module.find_uniform_witness
 
@@ -74,11 +74,17 @@ def test_lookup_only_columns_skip_the_witness_search(monkeypatch):
         "reads_aux__1__base__timestamp_lt_aux__lower_decomp__0_0@10",
         "reads_aux__1__base__timestamp_lt_aux__lower_decomp__1_0@11",
     }
-    assert snd.mapping.unmapped == lookup_only
-    assert set(snd.mapping.unmapped_reason.values()) == {"lookup-only"}
+    # They are only range-checked, so the mapping picks 0 for them and the
+    # range checks [0, bits] are table rows.
+    assert not snd.mapping.unmapped
+    assert {c: snd.mapping.defs[c] for c in lookup_only} == dict.fromkeys(lookup_only, 0)
+    assert {snd.mapping.source[c] for c in lookup_only} == {"lookup-only zero"}
     assert not snd.mapping.witnesses
-    stuck = bus_obligations(snd, "undecided")
-    assert len(stuck) == 2 and {o.reason for o in stuck} == {"lookup-only column"}
+    assert not bus_obligations(snd, "undecided")
+    # remove_trivial dropped them because their multiplicity is 0: trivial now
+    # that their columns are mapped (evaluated, had it been nonzero).
+    names = {o.name for o in bus_obligations(snd) if o.rung in ("trivial", "evaluated")}
+    assert len(names) >= 2
     assert not snd.counts("constraint")["undecided"]  # constraints are unaffected
 
 

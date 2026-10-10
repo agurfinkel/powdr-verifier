@@ -17,7 +17,13 @@ from dataclasses import dataclass, field
 
 from src.polysolver import Expr, Opaque, PolySolver, find_uniform_witness, variables
 
-from .circuit import Circuit, interaction_columns, recipe_columns, substitute
+from .circuit import (
+    Circuit,
+    interaction_columns,
+    recipe_columns,
+    substitute,
+)
+from .tables import VARIABLE_RANGE_CHECKER
 
 
 class MissingDefinition(Exception):
@@ -70,12 +76,21 @@ def soundness_mapping(
         if not _from_derived(m, col, before) and not _from_subs(m, col, subs, after)
     ]
     # A column used only by lookups (no constraint mentions it) has nothing for
-    # the witness search to check against: with no targets, any shortlisted
-    # column would "pass". Leave it unmapped. These are typically free columns
-    # whose range check the pass dropped; proving them needs table semantics.
+    # the witness search to check against. Typically it is a free column whose
+    # range check the pass dropped. Its value is ours to choose: if every
+    # interaction that mentions it is a range check [col, bits] of the bare
+    # column with a constant width, pick 0, a row of every width, and the sweep
+    # evaluates those lookups. Otherwise (an expression argument, another bus,
+    # a stateful interaction) 0 may be wrong, so leave it unmapped as before.
     in_constraints = _constraint_columns(before) # all candidate columns in algebraic constraints
+    lookup_only = [col for col in left if col not in in_constraints]
+    interactions = _interactions_by_column(before, lookup_only)
     for col in left:
-        if col not in in_constraints:
+        if col in in_constraints:
+            continue
+        if _only_range_checked(col, interactions[col]):
+            m.defs[col], m.source[col] = 0, "lookup-only zero"
+        else:
             m.unmapped.add(col)
             m.unmapped_reason[col] = "lookup-only"
     left = [col for col in left if col in in_constraints]
@@ -95,6 +110,34 @@ def soundness_mapping(
             m.source[col] = "witness"
         m.witnesses.append((sorted(group), r))
     return m
+
+
+def _interactions_by_column(c: Circuit, cols: list[str]) -> dict[str, list[dict]]:
+    """For each of ``cols``, the interactions of ``c`` that mention it (one pass)."""
+    out: dict[str, list[dict]] = {col: [] for col in cols}
+    if not cols:
+        return out
+    for bi in c.bus_interactions:
+        for col in interaction_columns(bi) & out.keys():
+            out[col].append(bi)
+    return out
+
+
+def _only_range_checked(col: str, interactions: list[dict]) -> bool:
+    """Every interaction that mentions ``col`` is [col, constant] on the range checker."""
+    seen = False
+    for bi in interactions:
+        args = bi["args"]
+        if not (
+            bi["id"] == VARIABLE_RANGE_CHECKER
+            and len(args) == 2
+            and args[0] == col
+            and isinstance(args[1], int)
+            and col not in variables(bi["mult"])
+        ):
+            return False
+        seen = True
+    return seen
 
 
 def _needed(cand: Circuit, ref: Circuit) -> list[str]:
