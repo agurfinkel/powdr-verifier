@@ -137,3 +137,22 @@ def test_solve_constants_after_hints():
     assert s.solve_constants() == 1
     assert s.implies(sub("y", 3)).rule == "trivial"
     assert s.solved_rejected == 0
+
+
+
+# ---------------------------------------------------------------- equality, normal form
+
+def test_implies_equal_is_value_equality():
+    s = solver({"x", "y", "z"}, [sub("x", "y")])
+    assert s.implies_equal("x", "y").rule == "normalize"
+    assert isinstance(s.implies_equal("x", "z"), Unknown)
+    assert s.implies_equal(add("x", 1), add(1, "x")).rule == "trivial"
+
+
+def test_normal_form_sees_solved_equations_and_defs():
+    s = solver({"x", "a"}, [sub("x", add("a", 1))])
+    assert isinstance(s.add_solved("x", add("a", 1), tag="h"), Implied)
+    assert s.normal_form("x") == s.normal_form(add("a", 1))
+    defs = s.make_defs({"w": "x"})
+    assert s.normal_form("w", defs) == s.normal_form(add(1, "a"))
+    assert s.normal_form("w") is None  # w is unknown without the defs

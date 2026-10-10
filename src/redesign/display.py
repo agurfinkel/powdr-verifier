@@ -61,15 +61,21 @@ RUNG_NOTE = {
     "normalize": "PolySolver rule N",
     "nowrap-split": "PolySolver rule S",
 }
-# The same for stateless bus interactions: canonical rungs only, so far.
+# The same for stateless bus interactions.
 BUS_ROWS = [
     ("trivial", "", "multiplicity is 0: the lookup asserts nothing"),
     ("identical", "direct", "the reference has the same lookup (bus, mult, args)"),
     ("identical", "via mapping", "same, once mapped columns are substituted"),
+    ("evaluated", "direct", "constant arguments that form a table row"),
+    ("evaluated", "via mapping", "same, once mapped columns are substituted"),
+    ("congruence", "direct", "PolySolver proves mult and args equal to a reference lookup's"),
+    ("congruence", "via mapping", "same, with mapped columns substituted"),
 ]
 BUS_RUNG_NOTE = {
     "trivial": "rung 1, canon mult = 0",
     "identical": "rung 2, lens _bus_exact_key",
+    "evaluated": "rung 3, table row (not PcLookup)",
+    "congruence": "rung 4, PolySolver implies_equal",
 }
 
 LEGEND = """\

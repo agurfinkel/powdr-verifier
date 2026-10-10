@@ -9,11 +9,20 @@ reference side's constraints and byte ranges. The rungs, cheapest first:
   undecided  - nothing applied; left for the SMT rungs (not built yet)
 
 A stateless bus interaction (a lookup) is the fact "mult != 0 => args in
-table". Its obligation I[w] is discharged by canonical rungs only, for now:
+table", where the table is an uninterpreted predicate. Its obligation I[w]:
 
   trivial    - mult[w] is zero, so the lookup asserts nothing
   identical  - the reference has an interaction with the same bus, mult and
                args (lens's _bus_exact_key), so it already asserts this fact
+  evaluated  - every argument is a constant (under the mapping and the solved
+               equations) and the tuple is a table row (tables.is_row); the
+               only rung that uses what a table contains. PcLookup is not
+               evaluated (not trusted)
+  congruence - a reference interaction J on the same bus with PolySolver
+               proving mult_I = mult_J and arg_I,k = arg_J,k for every k: by
+               congruence, J's fact gives I's. J is proposed by an index on
+               PolySolver's normal forms (untrusted search); only the
+               implies_equal verdicts decide
 
 Results are cached by canonical key. A direction is verified only if no
 obligation is undecided. Stateful buses (memory, execution bridge) are not
@@ -40,9 +49,19 @@ from src.polysolver import (
 
 from .circuit import Circuit, interaction_columns, substitute, substitute_interaction
 from .mapping import Mapping
+from .tables import is_row
+
+PC_LOOKUP = 2  # its table is the program: never evaluated (not trusted)
 
 # Rungs that prove an obligation; anything else is "undecided".
-DISCHARGED = ("trivial", "identical", "normalize", "nowrap-split")
+DISCHARGED = (
+    "trivial",
+    "identical",
+    "normalize",
+    "nowrap-split",
+    "evaluated",
+    "congruence",
+)
 
 
 @dataclass(frozen=True)
@@ -87,6 +106,10 @@ REASONS = {
     "bus: args differ": "reference interactions with this bus and multiplicity"
     " exist, but none has the same args",
     "bus: not canonical": "lens could not canonicalize the interaction",
+    "bus: constant args not a row": "every argument is a constant and the tuple is"
+    " not a table row: a real failure if the multiplicity can be nonzero",
+    "bus: pc_lookup not trusted": "a program-counter lookup with constant"
+    " arguments; its table is the program, which the redesign does not evaluate",
 }
 
 
@@ -204,6 +227,13 @@ def sweep(
         except CanonError:
             pass  # cannot be matched; costs completeness only
     bus_cache: dict = {}  # canonical key of I[w] -> its verdict
+    # Untrusted index for the congruence rung: reference lookups by their normal
+    # form under the solved equations. It only proposes a J; implies_equal decides.
+    ref_index: dict = {}
+    for j, r in enumerate(ref.stateless):
+        k = _normal_key(solver, r)
+        if k is not None:
+            ref_index.setdefault(k, (j, r))
 
     def check_bus(name: str, bi: dict) -> Obligation:
         """Discharge one stateless interaction by canonical matching."""
@@ -240,16 +270,20 @@ def sweep(
             # Rung 2: the reference asserts this very fact (same bus, mult, args).
             ob = Obligation(name, "identical", via_mapping=mapped, kind="bus")
         else:
-            same_mult = (bw["id"], mult) in ref_bus_mults
-            reason = "bus: args differ" if same_mult else "bus: no same-mult reference"
-            ob = Obligation(
-                name,
-                "undecided",
-                f"bus {bw['id']}",
-                reason=reason,
-                via_mapping=mapped,
-                kind="bus",
-            )
+            ob = _by_tables_or_congruence(name, bi, defs, solver, ref, ref_index, mapped)
+            if ob is None:
+                same_mult = (bw["id"], mult) in ref_bus_mults
+                reason = (
+                    "bus: args differ" if same_mult else "bus: no same-mult reference"
+                )
+                ob = Obligation(
+                    name,
+                    "undecided",
+                    f"bus {bw['id']}",
+                    reason=reason,
+                    via_mapping=mapped,
+                    kind="bus",
+                )
         bus_cache[key] = ob
         return ob
 
@@ -264,6 +298,81 @@ def sweep(
     report.hints_accepted = solver.solved_count - solver.constants_solved
     report.hints_rejected = solver.solved_rejected
     return report
+
+
+def _normal_key(solver: PolySolver, bi: dict, defs=None) -> tuple | None:
+    """(bus, mult, args) in PolySolver's normal form, for the untrusted index."""
+    nf = [
+        solver.normal_form(e, defs) if defs is not None else solver.normal_form(e)
+        for e in [bi["mult"], *bi["args"]]
+    ]
+    if any(x is None for x in nf):
+        return None
+    return (bi["id"], nf[0], tuple(nf[1:]))
+
+
+def _constant(nf: tuple) -> int | None:
+    """The value of a normal form with no variables, else None."""
+    if not nf:
+        return 0
+    if len(nf) == 1 and nf[0][0] == ():
+        return nf[0][1]
+    return None
+
+
+def _by_tables_or_congruence(
+    name: str,
+    bi: dict,
+    defs,
+    solver: PolySolver,
+    ref: Circuit,
+    ref_index: dict,
+    mapped: bool,
+) -> Obligation | None:
+    """The evaluated and congruence rungs for one lookup; None if neither applies."""
+    key = _normal_key(solver, bi, defs)
+    if key is None:
+        return None
+    bus, _, args = key
+    values = [_constant(a) for a in args]
+    constant = all(v is not None for v in values)
+    if constant and bus != PC_LOOKUP:
+        # Rung 3: constant arguments. Decide by the table, whatever the mult is:
+        # a row makes "mult != 0 => row" true outright. PcLookup is never
+        # evaluated (its table is the program); congruence below needs no table.
+        row = is_row(bus, values)
+        if row:
+            return Obligation(name, "evaluated", f"bus {bus} row {values}",
+                              via_mapping=mapped, kind="bus")
+        if row is False:
+            return Obligation(
+                name, "undecided", f"bus {bus} {values}",
+                reason="bus: constant args not a row", via_mapping=mapped, kind="bus",
+            )
+    # Rung 4: congruence with a reference lookup J proposed by the index.
+    ob = _congruence(name, bi, defs, solver, ref, ref_index.get(key), mapped)
+    if ob is None and constant and bus == PC_LOOKUP:
+        return Obligation(
+            name, "undecided", "pc_lookup", reason="bus: pc_lookup not trusted",
+            via_mapping=mapped, kind="bus",
+        )
+    return ob
+
+
+def _congruence(name, bi, defs, solver, ref, found, mapped) -> Obligation | None:
+    """I follows from the proposed J if PolySolver proves mult and every arg equal."""
+    if found is None:
+        return None
+    j, J = found
+    used = set()
+    for x, y in zip([bi["mult"], *bi["args"]], [J["mult"], *J["args"]]):
+        v = solver.implies_equal(x, y, defs)
+        if not isinstance(v, Implied):
+            return None
+        used.update(v.premises)
+        used.update(f"solved {t}" for t in v.solved)
+    detail = ", ".join([f"{ref.label}:b{j}", *sorted(used)])
+    return Obligation(name, "congruence", detail, via_mapping=mapped, kind="bus")
 
 
 # PolySolver's Unknown.kind -> our reason label. "no single premise" is a
