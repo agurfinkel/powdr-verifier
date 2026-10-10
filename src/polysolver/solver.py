@@ -299,19 +299,8 @@ class PolySolver:
         if opaque:
             return Unknown(f"opaque: {', '.join(opaque)}", "opaque")
 
-        # Expansion resolves each defined variable to its cached definition,
-        # so q[Defs] is never built as an expression. Declared variables go
-        # through the solved equations, and so do the definitions' values.
-        def lookup(n: str) -> P.Poly:
-            v = self._var(n)
-            if v in defs.polys:
-                if defs.polys[v] is None:
-                    raise P.ExpansionLimit
-                return self._reduce(defs.polys[v])
-            return self._plain(n)
-
         try:
-            k = P.zkey(P.expand(q, lookup, self.p, self.max_terms), self.p)
+            k = P.zkey(P.expand(q, self._expander(defs), self.p, self.max_terms), self.p)
         except P.ExpansionLimit:
             return Unknown("expansion limit", "expansion-limit")
 
@@ -331,6 +320,43 @@ class PolySolver:
                 verdict.rule, verdict.premises, verdict.ranges, tuple(used), solved
             )
         return verdict
+
+    def implies_equal(self, a: Expr, b: Expr, defs: Defs = NO_DEFS) -> Verdict:
+        """Is ``a = b`` implied, as values in F_p? The same question as implies(a - b)."""
+        return self.implies([a, "-", b], defs)
+
+    def normal_form(self, e: Expr, defs: Defs = NO_DEFS) -> tuple | None:
+        """``e`` expanded under the Defs and the solved equations, as a hashable value.
+
+        For proposing candidates only (e.g. an index of lookups): two expressions
+        with the same normal form are equal, but a caller that relies on it must
+        still ask implies or implies_equal, so that every verdict comes from the
+        rules. None if ``e`` mentions an opaque or unknown variable, or is too big.
+        """
+        for n in variables(e):
+            try:
+                v = self._var(n)
+            except UndefinedVariable:
+                return None
+            if not (v in self.declared or v in defs.polys):
+                return None
+        try:
+            return tuple(sorted(P.expand(e, self._expander(defs), self.p, self.max_terms).items()))
+        except P.ExpansionLimit:
+            return None
+
+    def _expander(self, defs: Defs):
+        """Expansion lookup: Defs (reduced on use), then the solved equations."""
+
+        def lookup(n: str) -> P.Poly:
+            v = self._var(n)
+            if v in defs.polys:
+                if defs.polys[v] is None:
+                    raise P.ExpansionLimit
+                return self._reduce(defs.polys[v])
+            return self._plain(n)
+
+        return lookup
 
     def _q_vars(self, names: set[str], defs: Defs) -> set[Var]:
         """Declared variables of q, including those inside the Defs it uses."""

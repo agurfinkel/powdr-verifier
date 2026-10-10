@@ -40,20 +40,22 @@ def test_noop_step_verified_with_lookups():
         assert r.verified and r.counts("bus")["identical"] > 0, r.direction
 
 
-def test_removed_constant_lookups_are_undecided():
+def test_removed_constant_lookups_are_evaluated_except_pc_lookup():
     # remove_disconnected drops 14 lookups with constant args: 5 PcLookup,
-    # 2 VariableRangeChecker, 7 BitwiseLookup (lens diff: "bus: -14").
+    # 2 VariableRangeChecker, 7 BitwiseLookup (lens diff: "bus: -14"). The
+    # range and bitwise ones are table rows; PcLookup is not evaluated.
     cmp, snd = check("keccak", "2099512", "005", "006")
     assert cmp.verified  # every After lookup is still in Before
     before = load_step("keccak", "2099512", "005")
-    undecided = collections.Counter(
-        (before.stateless[int(o.name.split(":b")[1])]["id"], o.reason)
-        for o in bus_obligations(snd, "undecided")
+    outcome = collections.Counter(
+        (before.stateless[int(o.name.split(":b")[1])]["id"], o.rung, o.reason)
+        for o in bus_obligations(snd)
+        if o.rung in ("undecided", "evaluated")
     )
-    assert undecided == {
-        (6, "bus: args differ"): 7,
-        (2, "bus: no same-mult reference"): 5,
-        (3, "bus: args differ"): 2,
+    assert outcome == {
+        (6, "evaluated", ""): 7,
+        (3, "evaluated", ""): 2,
+        (2, "undecided", "bus: pc_lookup not trusted"): 5,
     }
 
 
@@ -124,3 +126,36 @@ def test_zero_multiplicity_lookup_is_trivial(is_zero_dumps):
     cmp = _completeness_with(is_zero_dumps, edit)
     assert len(bus_obligations(cmp, "trivial")) == 1
     assert not bus_obligations(cmp, "undecided")
+
+
+def test_constant_lookup_not_a_row_is_reported(is_zero_dumps):
+    def edit(after):
+        vrc = _first_lookup(after, 3)
+        vrc["args"] = [300, 8]  # 300 does not fit in 8 bits
+
+    cmp = _completeness_with(is_zero_dumps, edit)
+    stuck = bus_obligations(cmp, "undecided")
+    assert [o.reason for o in stuck] == ["bus: constant args not a row"]
+
+
+def test_constant_lookup_row_is_evaluated(is_zero_dumps):
+    def edit(after):
+        bw = _first_lookup(after, 6)
+        bw["args"] = [12, 10, 12 ^ 10, 1]  # z = x xor y on bytes
+
+    cmp = _completeness_with(is_zero_dumps, edit)
+    assert len(bus_obligations(cmp, "evaluated")) == 1
+    assert not bus_obligations(cmp, "undecided")
+
+
+def test_congruence_through_solved_equations():
+    # 013 -> 014 (solver): lookup args were rewritten by powdr's substitutions;
+    # with the hints solved, each one is congruent to a Before lookup.
+    (cmp,) = check("keccak", "2100224", "013", "014", ("completeness",))
+    cong = bus_obligations(cmp, "congruence")
+    assert len(cong) >= 1000
+    assert all(o.detail.startswith("013_") for o in cong)  # names the Before lookup J
+    (plain,) = check(
+        "keccak", "2100224", "013", "014", ("completeness",), use_hints=False
+    )
+    assert len(bus_obligations(plain, "congruence")) < len(cong)  # the hints matter
